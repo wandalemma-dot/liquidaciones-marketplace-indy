@@ -10,6 +10,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+app.set('trust proxy', 1); // Necesario detras del proxy de Render/Railway (https)
 const PORT = process.env.PORT || 3001;
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 
@@ -33,6 +34,14 @@ const formatStoreUrl = (url) => {
 
 // Leer credenciales de la App guardadas localmente
 const readConfig = async () => {
+  // En produccion, las credenciales vienen de variables de entorno (nunca del repo).
+  if (process.env.SHOPIFY_CLIENT_ID && process.env.SHOPIFY_CLIENT_SECRET) {
+    return {
+      clientId: process.env.SHOPIFY_CLIENT_ID,
+      clientSecret: process.env.SHOPIFY_CLIENT_SECRET,
+    };
+  }
+  // En desarrollo local, se lee del archivo config.json.
   try {
     const data = await fs.readFile(CONFIG_PATH, 'utf8');
     return JSON.parse(data);
@@ -85,7 +94,8 @@ app.get('/api/auth', async (req, res) => {
   }
 
   const scopes = 'read_orders,read_products,read_inventory,read_returns,read_order_edits,read_locations';
-  const redirectUri = `http://localhost:${PORT}/api/auth/callback`;
+  const appUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
+  const redirectUri = `${appUrl}/api/auth/callback`;
 
   // Redirigir al usuario al login de Shopify para autorizar
   const authorizeUrl = `https://${cleanShop}/admin/oauth/authorize?client_id=${config.clientId}&scope=${scopes}&redirect_uri=${encodeURIComponent(redirectUri)}`;
@@ -116,7 +126,7 @@ app.get('/api/auth/callback', async (req, res) => {
     }
 
     // Redirigir de vuelta al panel de React, pasando el shop y el token en la URL
-    res.redirect(`http://localhost:${PORT}/?shop=${cleanShop}&token=${accessToken}`);
+    res.redirect(`/?shop=${cleanShop}&token=${accessToken}`);
   } catch (error) {
     console.error('Error al realizar el intercambio de token OAuth:', error.message);
     res.status(500).send(`Error de autenticación con Shopify: ${error.response?.data?.error_description || error.message}`);
