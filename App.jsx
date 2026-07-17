@@ -319,9 +319,10 @@ function App() {
         const unitCost = isEdited ? editedCosts[sku] : item.unitCost;
         const hasCostInShopify = item.hasCostInShopify || isEdited;
 
-        // Usar costo original del backend. Solo recalcular si se editó manualmente en la UI
+        // Costo de lista (sin descuento) = costo neto inflado por el % del proveedor.
+        // Se aplica a TODOS los articulos de la marca, no solo a los editados a mano.
         let unitCostOriginal = item.unitCostOriginal || unitCost;
-        if (isEdited && discountPercent > 0 && discountPercent < 100) {
+        if (discountPercent > 0 && discountPercent < 100) {
           unitCostOriginal = unitCost / (1 - (discountPercent / 100));
         }
 
