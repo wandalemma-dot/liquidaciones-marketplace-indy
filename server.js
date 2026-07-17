@@ -328,6 +328,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
                     edges {
                       node {
                         quantity
+                        restockType
                         location {
                           name
                         }
@@ -602,6 +603,10 @@ app.post('/api/fetch-settlements', async (req, res) => {
             const refundItem = edge.node;
             const item = refundItem.lineItem;
             if (!item) return;
+
+            // NO contar cancelaciones por edicion de orden (ej. cambio de talle antes de despachar):
+            // no son devoluciones reales, el proveedor conserva la venta del articulo que si se despacho.
+            if (refundItem.restockType === 'CANCEL') return;
 
             // Omitir reembolsos de artículos unfulfilled (no preparados) y que fueron eliminados (currentQuantity = 0)
             const isFulfilledOrPOS = !!fulfilledItemMap[item.id] || !!orderLoc;
