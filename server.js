@@ -494,8 +494,25 @@ app.post('/api/fetch-settlements', async (req, res) => {
       });
     };
 
+    // Excepciones de marcas que deben conservar una capitalización específica
+    // (ej. siglas). Clave en minúsculas -> nombre a mostrar.
+    const brandCasingExceptions = {
+      // 'dc': 'DC',
+      // 'h&m': 'H&M',
+    };
+
+    // Convierte a Title Case de forma ESTABLE: "gotcha" y "Gotcha" -> "Gotcha".
+    // Esto garantiza que una misma marca escrita con distintas may/minúsculas
+    // se agrupe en un solo proveedor (una sola hoja Liq/Agr).
+    const toTitleCase = (str) =>
+      str
+        .split(' ')
+        .map((w) => (w ? w[0].toUpperCase() + w.slice(1).toLowerCase() : w))
+        .join(' ');
+
     const normalizeBrand = (vendor, title = '') => {
-      let b = vendor?.trim() || 'Sin Marca';
+      // Normalizar espacios en blanco y quitar espacios extra
+      let b = (vendor?.trim() || 'Sin Marca').replace(/\s+/g, ' ');
       let t = title?.toUpperCase() || '';
 
       if (t.includes('X BRAND & CO') || t.includes('X BRAND&CO') || t.includes('X BRAND')) {
@@ -505,7 +522,13 @@ app.post('/api/fetch-settlements', async (req, res) => {
       if (b.toUpperCase().includes('FAMILYARG')) {
         return 'FAMILYARG';
       }
-      return b;
+
+      // Unificar variantes por may/minúsculas (ej: "gotcha" == "Gotcha")
+      const key = b.toLowerCase();
+      if (brandCasingExceptions[key]) {
+        return brandCasingExceptions[key];
+      }
+      return toTitleCase(b);
     };
 
     allOrders.forEach((order) => {
