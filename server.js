@@ -831,9 +831,25 @@ app.post('/api/export-excel', async (req, res) => {
     summarySheet.getColumn(7).width = 15;
 
     // HOJAS POR MARCA
+    // Excel no permite dos hojas con el mismo nombre (y NO distingue mayus/minus).
+    // Este helper garantiza nombres unicos: si "Liq - Gotcha" ya existe, usa "Liq - Gotcha (2)", etc.
+    const usedSheetNames = new Set();
+    const makeSheetName = (prefix, name) => {
+      let base = `${prefix}${name}`.replace(/[*?:/[\]\\]/g, '').substring(0, 31);
+      let candidate = base;
+      let n = 2;
+      while (usedSheetNames.has(candidate.toLowerCase())) {
+        const suffix = ` (${n})`;
+        candidate = base.substring(0, 31 - suffix.length) + suffix;
+        n++;
+      }
+      usedSheetNames.add(candidate.toLowerCase());
+      return candidate;
+    };
+
     Object.keys(details).forEach((brandName) => {
       const vendorData = details[brandName];
-      const tabName = `Liq - ${brandName}`.substring(0, 30).replace(/[*?:/[\]\\]/g, '');
+      const tabName = makeSheetName('Liq - ', brandName);
       const detailSheet = workbook.addWorksheet(tabName);
       detailSheet.views = [{ showGridLines: true }];
 
@@ -990,7 +1006,7 @@ app.post('/api/export-excel', async (req, res) => {
       // ==========================================
       // HOJA DE AGRUPADOS (Agr - BRAND)
       // ==========================================
-      const agrTabName = `Agr - ${brandName}`.substring(0, 30).replace(/[*?:/[\]\\]/g, '');
+      const agrTabName = makeSheetName('Agr - ', brandName);
       const agrSheet = workbook.addWorksheet(agrTabName);
       agrSheet.views = [{ showGridLines: false }];
 
