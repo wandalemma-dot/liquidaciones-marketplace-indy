@@ -2,6 +2,25 @@ import React, { useState, useEffect, useMemo } from 'react';
 import axios from 'axios';
 import './App.css';
 
+// Descuentos comerciales FIJOS por proveedor (valores por defecto).
+// Se aplican solos en cualquier dispositivo. Un cambio manual en la UI los pisa.
+// Claves en minuscula para que funcionen sin importar mayus/minus ni espacios extra.
+const DEFAULT_DISCOUNTS = {
+  'orng': 15,
+  'orng mochilas': 12.5,
+  'airwalk': 15,
+  'amerika sb': 15,
+  'mormaii': 15,
+  'vision street wear': 15,
+  'gotcha': 20,
+};
+
+// Normaliza un nombre de marca para buscar su descuento por defecto.
+const defaultDiscountFor = (brandName) => {
+  if (!brandName) return undefined;
+  return DEFAULT_DISCOUNTS[brandName.toString().trim().toLowerCase()];
+};
+
 function App() {
   // Credenciales de la App (Dev Dashboard / OAuth)
   const [clientId, setClientId] = useState('');
@@ -292,7 +311,10 @@ function App() {
 
     Object.keys(rawSettlementData.details).forEach((rawBrand) => {
       const brandData = rawSettlementData.details[rawBrand];
-      const discountPercent = parseFloat(supplierDiscounts[rawBrand]) || 0;
+      const manualDiscount = supplierDiscounts[rawBrand];
+      const discountPercent = (manualDiscount !== undefined && manualDiscount !== '')
+        ? parseFloat(manualDiscount)
+        : (defaultDiscountFor(rawBrand) || 0);
 
       brandData.items.forEach((item) => {
         // Filtrar por ubicación si está seleccionada
@@ -832,7 +854,7 @@ function App() {
                     className="form-control"
                     style={{padding: '0.3rem 0.5rem', fontSize: '0.85rem', textAlign: 'right'}}
                     placeholder="0"
-                    value={supplierDiscounts[row.brandName] || ''}
+                    value={supplierDiscounts[row.brandName] ?? (defaultDiscountFor(row.brandName) ?? '')}
                     onChange={(e) => handleUpdateDiscount(row.brandName, e.target.value)}
                   />
                   <span style={{fontSize: '0.85rem', color: 'var(--text-muted)'}}>%</span>
