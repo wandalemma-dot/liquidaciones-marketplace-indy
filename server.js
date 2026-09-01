@@ -233,7 +233,15 @@ app.post('/api/fetch-settlements', async (req, res) => {
   }
 
   try {
-    let queryFilters = `(created_at:>=${startDate}T00:00:00Z AND created_at:<=${endDate}T23:59:59Z) OR (updated_at:>=${startDate}T00:00:00Z AND updated_at:<=${endDate}T23:59:59Z)`;
+    // El corte del mes se hace en hora de Argentina, no en UTC: sin esto, una venta del 31/8
+    // a las 22:00 (01:00 UTC del 1/9) se escapaba del período.
+    const TZ_OFFSET = '-03:00';
+
+    // Se traen los pedidos creados en el período MÁS todos los actualizados desde el inicio del
+    // período, sin tope superior: un pedido de julio despachado en agosto puede haberse vuelto a
+    // actualizar en septiembre y aun así su despacho pertenece a agosto. El recorte real por
+    // fecha de despacho se hace más abajo, en código.
+    let queryFilters = `(created_at:>=${startDate}T00:00:00${TZ_OFFSET} AND created_at:<=${endDate}T23:59:59${TZ_OFFSET}) OR (updated_at:>=${startDate}T00:00:00${TZ_OFFSET})`;
 
     if (financialStatus && financialStatus !== 'any') {
       queryFilters += ` AND financial_status:${financialStatus}`;
@@ -268,8 +276,9 @@ app.post('/api/fetch-settlements', async (req, res) => {
                 retailLocation {
                   name
                 }
-                fulfillments(first: 10) {
+                fulfillments(first: 50) {
                   id
+                  createdAt
                   location {
                     name
                   }
@@ -394,8 +403,8 @@ app.post('/api/fetch-settlements', async (req, res) => {
       cursor = ordersData?.pageInfo?.endCursor || null;
     }
 
-    const startDateTime = new Date(`${startDate}T00:00:00Z`).getTime();
-    const endDateTime = new Date(`${endDate}T23:59:59Z`).getTime();
+    const startDateTime = new Date(`${startDate}T00:00:00${TZ_OFFSET}`).getTime();
+    const endDateTime = new Date(`${endDate}T23:59:59${TZ_OFFSET}`).getTime();
 
     const vendorAggregates = {};
     const missingCosts = [];
@@ -582,44 +591,77 @@ app.post('/api/fetch-settlements', async (req, res) => {
         itemCurrentQuantityMap[item.id] = item.currentQuantity !== undefined ? item.currentQuantity : item.quantity;
       });
 
-      const orderProcessedTime = new Date(order.processedAt).getTime();
-      if (orderProcessedTime >= startDateTime && orderProcessedTime <= endDateTime) {
-        const lineItems = order.lineItems?.edges || [];
-        lineItems.forEach((edge) => {
-          const item = edge.node;
+      // ============================================================================
+      // VENTAS: se liquidan por FECHA DE DESPACHO, no por fecha del pedido.
+      // Un artículo de un pedido de julio despachado el 4/8 corresponde a agosto, y un
+      // artículo pagado pero todavía no despachado no se liquida hasta que sale.
+      // ============================================================================
 
-          // Omitir artículos unfulfilled (no preparados) y que fueron eliminados de la orden (currentQuantity = 0)
-          const isFulfilledOrPOS = !!fulfilledItemMap[item.id] || !!orderLoc;
-          const currentQty = itemCurrentQuantityMap[item.id];
-          if (!isFulfilledOrPOS && currentQty === 0) {
+      const extractCost = (item) => {
+        if (item.variant?.inventoryItem?.unitCost?.amount) {
+          return { unitCost: parseFloat(item.variant.inventoryItem.unitCost.amount), hasCostInShopify: true };
+        }
+        return { unitCost: 0, hasCostInShopify: false };
+      };
+
+      if (orderLoc) {
+        // Venta de local (POS): no genera despacho, se toma por la fecha del pedido.
+        const orderProcessedTime = new Date(order.processedAt).getTime();
+        if (orderProcessedTime >= startDateTime && orderProcessedTime <= endDateTime) {
+          lineItemsList.forEach((edge) => {
+            const item = edge.node;
+
+            // Omitir artículos que fueron eliminados de la orden (currentQuantity = 0)
+            if (itemCurrentQuantityMap[item.id] === 0) {
+              return;
+            }
+
+            const brand = normalizeBrand(item.vendor, item.title);
+            const salePrice = parseFloat(item.originalUnitPriceSet?.shopMoney?.amount || 0);
+            const { unitCost, hasCostInShopify } = extractCost(item);
+
+            registerItemRecord(brand, item, item.quantity, order.processedAt, order.name, 'Venta', hasCostInShopify, unitCost, salePrice, order.displayFinancialStatus, orderLoc);
+          });
+        }
+      } else {
+        // Venta online: se recorren los despachos, no los artículos del pedido.
+        const lineItemById = {};
+        lineItemsList.forEach((edge) => {
+          lineItemById[edge.node.id] = edge.node;
+        });
+
+        (order.fulfillments || []).forEach((f) => {
+          const fulfillmentTime = new Date(f.createdAt).getTime();
+          if (isNaN(fulfillmentTime) || fulfillmentTime < startDateTime || fulfillmentTime > endDateTime) {
             return;
           }
 
-          const brand = normalizeBrand(item.vendor, item.title);
-          const quantity = item.quantity;
-          const salePrice = parseFloat(item.originalUnitPriceSet?.shopMoney?.amount || 0);
+          const fulfillmentLoc = f.location?.name || 'Sin Ubicación';
+          const fItems = f.fulfillmentLineItems?.edges || [];
 
-          let unitCost = 0;
-          let hasCostInShopify = false;
-          if (item.variant?.inventoryItem?.unitCost?.amount) {
-            unitCost = parseFloat(item.variant.inventoryItem.unitCost.amount);
-            hasCostInShopify = true;
-          }
+          fItems.forEach((fEdge) => {
+            const fLine = fEdge.node;
+            const item = lineItemById[fLine.lineItem?.id];
+            if (!item) return;
 
-          // Determinar ubicación: buscar en mapa de despacho, sino usar la ubicación de POS, sino 'Sin Ubicación'
-          const itemLoc = itemLocationMap[item.id] || orderLoc || 'Sin Ubicación';
+            // Cantidad efectivamente despachada: un artículo puede salir en despachos parciales
+            const quantity = fLine.quantity;
+            if (!quantity) return;
 
-          registerItemRecord(brand, item, quantity, order.processedAt, order.name, 'Venta', hasCostInShopify, unitCost, salePrice, order.displayFinancialStatus, itemLoc);
+            const brand = normalizeBrand(item.vendor, item.title);
+            const salePrice = parseFloat(item.originalUnitPriceSet?.shopMoney?.amount || 0);
+            const { unitCost, hasCostInShopify } = extractCost(item);
+
+            registerItemRecord(brand, item, quantity, f.createdAt, order.name, 'Venta', hasCostInShopify, unitCost, salePrice, order.displayFinancialStatus, fulfillmentLoc);
+          });
         });
       }
 
       const refunds = order.refunds || [];
-      let processedRefundsForOrder = false;
 
       refunds.forEach((refund) => {
         const refundTime = new Date(refund.createdAt).getTime();
         if (refundTime >= startDateTime && refundTime <= endDateTime) {
-          processedRefundsForOrder = true;
           const refundLineItems = refund.refundLineItems?.edges || [];
           
           refundLineItems.forEach((edge) => {
@@ -657,30 +699,8 @@ app.post('/api/fetch-settlements', async (req, res) => {
         }
       });
 
-      if (order.cancelledAt) {
-        const cancellationTime = new Date(order.cancelledAt).getTime();
-        if (cancellationTime >= startDateTime && cancellationTime <= endDateTime && !processedRefundsForOrder) {
-          const lineItems = order.lineItems?.edges || [];
-          lineItems.forEach((edge) => {
-            const item = edge.node;
-            const brand = normalizeBrand(item.vendor, item.title);
-            const quantity = -item.quantity;
-            const salePrice = parseFloat(item.originalUnitPriceSet?.shopMoney?.amount || 0);
-
-            let unitCost = 0;
-            let hasCostInShopify = false;
-            if (item.variant?.inventoryItem?.unitCost?.amount) {
-              unitCost = parseFloat(item.variant.inventoryItem.unitCost.amount);
-              hasCostInShopify = true;
-            }
-
-            // Ubicación de cancelación: usar mapa de despacho, sino POS, sino 'Sin Ubicación'
-            const cancelLoc = itemLocationMap[item.id] || orderLoc || 'Sin Ubicación';
-
-            registerItemRecord(brand, item, quantity, order.cancelledAt, `${order.name}`, 'Cancelación', hasCostInShopify, unitCost, salePrice, order.displayFinancialStatus, cancelLoc);
-          });
-        }
-      }
+      // NOTA: acá había un bloque que registraba cancelaciones. Era código muerto: los pedidos
+      // cancelados salen por el `return` del principio de este forEach y nunca llegaban hasta acá.
     });
 
     const summary = Object.values(vendorAggregates).map((v) => {
@@ -923,9 +943,11 @@ app.post('/api/export-excel', async (req, res) => {
         const currentRowNum = detailStartRow + index;
         
         const dateObj = new Date(item.date);
-        const formattedDate = isNaN(dateObj.getTime()) 
-          ? item.date 
-          : dateObj.toISOString().split('T')[0]; // Format as YYYY-MM-DD
+        // Se muestra la fecha en hora de Argentina (-3), no en UTC: un despacho del 31/8 a las
+        // 22:52 es 01:52 UTC del 1/9, y mostrarlo como 01/09 en una liquidación de agosto confunde.
+        const formattedDate = isNaN(dateObj.getTime())
+          ? item.date
+          : new Date(dateObj.getTime() - 3 * 60 * 60 * 1000).toISOString().split('T')[0]; // YYYY-MM-DD
 
         const refundVal = item.quantity < 0 ? item.totalSale : 0;
         const grossProfit = item.totalSale - item.totalCost;
