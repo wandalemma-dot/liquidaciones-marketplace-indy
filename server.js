@@ -279,6 +279,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
                 fulfillments(first: 50) {
                   id
                   createdAt
+                  status
                   location {
                     name
                   }
@@ -287,6 +288,26 @@ app.post('/api/fetch-settlements', async (req, res) => {
                       node {
                         lineItem {
                           id
+                          title
+                          vendor
+                          variantTitle
+                          sku
+                          originalUnitPriceSet {
+                            shopMoney {
+                              amount
+                            }
+                          }
+                          variant {
+                            id
+                            sku
+                            price
+                            inventoryItem {
+                              id
+                              unitCost {
+                                amount
+                              }
+                            }
+                          }
                         }
                         quantity
                       }
@@ -408,6 +429,9 @@ app.post('/api/fetch-settlements', async (req, res) => {
 
     const vendorAggregates = {};
     const missingCosts = [];
+    // Red de seguridad: artículos despachados dentro del período que no se pudieron liquidar.
+    // Si esto vuelve con algo, hay ventas quedando afuera y hay que mirarlas a mano.
+    const skippedFulfillmentLines = [];
 
     const registerItemRecord = (brand, item, quantity, date, orderName, type, hasCostInShopify, unitCostShopify, salePrice, paymentStatus, location) => {
       
@@ -636,13 +660,28 @@ app.post('/api/fetch-settlements', async (req, res) => {
             return;
           }
 
+          // Los despachos cancelados siguen viniendo en la respuesta de Shopify. Si no se
+          // descartan, un pedido al que se le anuló un despacho y se le hizo otro (queda como
+          // F1 cancelado + F2 activo) se liquida DOS VECES.
+          const fulfillmentStatus = (f.status || '').toUpperCase();
+          if (['CANCELLED', 'CANCELED', 'ERROR', 'FAILURE'].includes(fulfillmentStatus)) {
+            return;
+          }
+
           const fulfillmentLoc = f.location?.name || 'Sin Ubicación';
           const fItems = f.fulfillmentLineItems?.edges || [];
 
           fItems.forEach((fEdge) => {
             const fLine = fEdge.node;
-            const item = lineItemById[fLine.lineItem?.id];
-            if (!item) return;
+
+            // Se busca el artículo en order.lineItems y, si no aparece ahí (pedidos editados,
+            // importados o con artículos agregados a mano), se usa el que trae el propio
+            // despacho. Antes, cuando no aparecía, la línea se perdía en silencio.
+            const item = lineItemById[fLine.lineItem?.id] || fLine.lineItem;
+            if (!item || (!item.title && !item.sku)) {
+              skippedFulfillmentLines.push({ orderName: order.name, fulfillmentId: f.id, reason: 'Sin datos del artículo' });
+              return;
+            }
 
             // Cantidad efectivamente despachada: un artículo puede salir en despachos parciales
             const quantity = fLine.quantity;
@@ -724,6 +763,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
       summary,
       details: vendorAggregates,
       missingCosts,
+      skippedFulfillmentLines,
     });
   } catch (error) {
     console.error('Error al procesar liquidaciones:', error.message);
