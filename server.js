@@ -328,6 +328,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
                       title
                       quantity
                       currentQuantity
+                      unfulfilledQuantity
                       vendor
                       variantTitle
                       sku
@@ -437,6 +438,8 @@ app.post('/api/fetch-settlements', async (req, res) => {
     const devolucionesEnCurso = [];
     // Pedidos con despachos en el período que no generaron ninguna venta.
     const pedidosSinLiquidar = [];
+    // Artículos rescatados cuyo despacho no traía los datos del artículo.
+    const lineasRecuperadas = [];
 
     const registerItemRecord = (brand, item, quantity, date, orderName, type, hasCostInShopify, unitCostShopify, salePrice, paymentStatus, location) => {
       
@@ -711,6 +714,38 @@ app.post('/api/fetch-settlements', async (req, res) => {
           });
         });
 
+        // RESCATE: cuando se edita un pedido ya despachado (por ejemplo para agregarle un
+        // remito), Shopify puede dejar de devolver los datos del artículo dentro del despacho.
+        // Ese artículo figura como enviado en el pedido pero no aparece en ningún despacho que
+        // podamos leer, y se perdía. Acá se recupera usando la fecha del despacho del período.
+        if (despachosEnPeriodo.length > 0) {
+          const primerDespacho = despachosEnPeriodo[0];
+          lineItemsList.forEach((edge) => {
+            const item = edge.node;
+            if (itemsConDespacho.has(item.id)) return;
+
+            const cantidadDespachada = (item.quantity || 0) - (item.unfulfilledQuantity ?? item.quantity ?? 0);
+            if (cantidadDespachada <= 0) return;
+
+            const brand = normalizeBrand(item.vendor, item.title);
+            const salePrice = parseFloat(item.originalUnitPriceSet?.shopMoney?.amount || 0);
+            const { unitCost, hasCostInShopify } = extractCost(item);
+
+            itemsConDespacho.add(item.id);
+            lineasRecuperadas.push({
+              orderName: order.name,
+              sku: item.sku || 'SIN_SKU',
+              title: item.title,
+              variantTitle: item.variantTitle || '',
+              quantity: cantidadDespachada,
+              fecha: primerDespacho.fecha,
+              motivo: 'El despacho no traía los datos del artículo (pedido editado despues de enviarse)',
+            });
+
+            registerItemRecord(brand, item, cantidadDespachada, primerDespacho.fecha, order.name, 'Venta', hasCostInShopify, unitCost, salePrice, order.displayFinancialStatus, primerDespacho.sucursal);
+          });
+        }
+
         // Venta de local (POS): los artículos que se entregan en el momento no generan
         // despacho, así que esos —y solo esos— se toman por la fecha del pedido.
         if (orderLoc) {
@@ -829,6 +864,10 @@ app.post('/api/fetch-settlements', async (req, res) => {
       console.log('=== PEDIDOS CON DESPACHOS EN EL PERIODO QUE NO GENERARON NINGUNA VENTA ===');
       console.log(JSON.stringify(pedidosSinLiquidar, null, 2));
     }
+    if (lineasRecuperadas.length) {
+      console.log('=== ARTICULOS RECUPERADOS (el despacho no traia sus datos) ===');
+      console.log(lineasRecuperadas.map((l) => `${l.orderName} ${l.sku} x${l.quantity} - ${l.fecha}`).join('\n'));
+    }
     if (devolucionesEnCurso.length) {
       console.log('=== DEVOLUCIONES EN CURSO (no se descontaron) ===');
       console.log(devolucionesEnCurso.map((d) => `${d.orderName} ${d.sku} x${d.quantity} - ${d.motivo}`).join('\n'));
@@ -843,6 +882,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
       skippedFulfillmentLines,
       devolucionesEnCurso,
       pedidosSinLiquidar,
+      lineasRecuperadas,
     });
   } catch (error) {
     console.error('Error al procesar liquidaciones:', error.message);
