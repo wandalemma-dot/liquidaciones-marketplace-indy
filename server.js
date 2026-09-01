@@ -225,7 +225,7 @@ app.post('/api/verify-connection', async (req, res) => {
 
 // Version del codigo en ejecucion y ultimo diagnostico, para poder verificar que el servidor
 // desplegado sea el que corresponde sin tener que entrar a los logs del hosting.
-const VERSION_APP = '2026-09-01-e';
+const VERSION_APP = '2026-09-01-f';
 let ultimoDiagnostico = { generado: null, resumen: 'Todavia no se genero ninguna liquidacion en este servidor.' };
 
 app.get('/api/version', (req, res) => {
@@ -449,6 +449,8 @@ app.post('/api/fetch-settlements', async (req, res) => {
     const pedidosSinLiquidar = [];
     // Artículos rescatados cuyo despacho no traía los datos del artículo.
     const lineasRecuperadas = [];
+    // Control final: artículos que Shopify da por despachados y no quedaron liquidados.
+    const articulosNoLiquidados = [];
 
     const registerItemRecord = (brand, item, quantity, date, orderName, type, hasCostInShopify, unitCostShopify, salePrice, paymentStatus, location) => {
       
@@ -656,6 +658,16 @@ app.post('/api/fetch-settlements', async (req, res) => {
 
         // Diagnóstico: qué despachos del período vio la app en este pedido y qué hizo con ellos.
         const despachosEnPeriodo = [];
+        const registradoPorItem = {};
+        const contar = (id, q) => { if (id) registradoPorItem[id] = (registradoPorItem[id] || 0) + q; };
+        const todosLosDespachos = (order.fulfillments || []).map((f) => ({
+          id: f.id, fecha: f.createdAt, estado: f.status || '(sin estado)', sucursal: f.location?.name || null,
+          enElPeriodo: (() => { const t = new Date(f.createdAt).getTime(); return !isNaN(t) && t >= startDateTime && t <= endDateTime; })(),
+          lineas: (f.fulfillmentLineItems?.edges || []).map((e) => ({
+            lineItemId: e.node.lineItem?.id || null, titulo: e.node.lineItem?.title || null,
+            sku: e.node.lineItem?.sku || null, cantidad: e.node.quantity,
+          })),
+        }));
         const registrosAntes = Object.values(vendorAggregates).reduce((n, v) => n + v.items.length, 0);
 
         // Artículos que salen por algún despacho, en cualquier fecha. Los de esta lista no
@@ -725,6 +737,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
             const salePrice = parseFloat(item.originalUnitPriceSet?.shopMoney?.amount || 0);
             const { unitCost, hasCostInShopify } = extractCost(item);
 
+            contar(fLine.lineItem?.id, quantity);
             registerItemRecord(brand, item, quantity, f.createdAt, order.name, 'Venta', hasCostInShopify, unitCost, salePrice, order.displayFinancialStatus, fulfillmentLoc);
           });
         });
@@ -757,6 +770,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
               motivo: 'El despacho no traía los datos del artículo (pedido editado despues de enviarse)',
             });
 
+            contar(item.id, cantidadDespachada);
             registerItemRecord(brand, item, cantidadDespachada, primerDespacho.fecha, order.name, 'Venta', hasCostInShopify, unitCost, salePrice, order.displayFinancialStatus, primerDespacho.sucursal);
           });
         }
@@ -779,6 +793,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
               const salePrice = parseFloat(item.originalUnitPriceSet?.shopMoney?.amount || 0);
               const { unitCost, hasCostInShopify } = extractCost(item);
 
+              contar(item.id, item.quantity);
               registerItemRecord(brand, item, item.quantity, order.processedAt, order.name, 'Venta', hasCostInShopify, unitCost, salePrice, order.displayFinancialStatus, orderLoc);
             });
           }
@@ -789,6 +804,28 @@ app.post('/api/fetch-settlements', async (req, res) => {
         const registrosDespues = Object.values(vendorAggregates).reduce((n, v) => n + v.items.length, 0);
         if (despachosEnPeriodo.length > 0 && registrosDespues === registrosAntes) {
           pedidosSinLiquidar.push({ orderName: order.name, despachos: despachosEnPeriodo });
+        }
+
+        // Control fino: artículo por artículo, lo que Shopify dice que se despachó contra lo
+        // que efectivamente se liquidó. Si falta algo, queda registrado con todo el detalle.
+        if (despachosEnPeriodo.length > 0) {
+          lineItemsList.forEach((edge) => {
+            const item = edge.node;
+            const despachado = (item.quantity || 0) - (item.unfulfilledQuantity ?? item.quantity ?? 0);
+            const liquidado = registradoPorItem[item.id] || 0;
+            if (despachado > liquidado) {
+              articulosNoLiquidados.push({
+                orderName: order.name,
+                sku: item.sku || 'SIN_SKU',
+                title: item.title,
+                variantTitle: item.variantTitle || '',
+                lineItemId: item.id,
+                despachado,
+                liquidado,
+                despachosDelPedido: todosLosDespachos,
+              });
+            }
+          });
         }
       }
 
@@ -876,6 +913,8 @@ app.post('/api/fetch-settlements', async (req, res) => {
       periodo: `${startDate} a ${endDate}`,
       pedidosTraidos: allOrders.length,
       lineasRecuperadas,
+      articulosNoLiquidados,
+      articulosNoLiquidados,
       skippedFulfillmentLines,
       pedidosSinLiquidar,
       devolucionesEnCurso,
