@@ -272,6 +272,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
                 processedAt
                 cancelledAt
                 displayFinancialStatus
+                returnStatus
                 displayFulfillmentStatus
                 retailLocation {
                   name
@@ -432,6 +433,8 @@ app.post('/api/fetch-settlements', async (req, res) => {
     // Red de seguridad: artículos despachados dentro del período que no se pudieron liquidar.
     // Si esto vuelve con algo, hay ventas quedando afuera y hay que mirarlas a mano.
     const skippedFulfillmentLines = [];
+    // Devoluciones que todavía no se descuentan porque el cambio no se cerró.
+    const devolucionesEnCurso = [];
 
     const registerItemRecord = (brand, item, quantity, date, orderName, type, hasCostInShopify, unitCostShopify, salePrice, paymentStatus, location) => {
       
@@ -728,6 +731,24 @@ app.post('/api/fetch-settlements', async (req, res) => {
             // no son devoluciones reales, el proveedor conserva la venta del articulo que si se despacho.
             if (refundItem.restockType === 'CANCEL') return;
 
+            // Una devolución se descuenta reción cuando la mercadería VOLVIÓ. Mientras el cambio
+            // está en curso (el cliente pidió la devolución pero la prenda todavía no se repuso),
+            // la venta se mantiene como venta normal y la nota de crédito espera al mes en que
+            // la devolución se cierre.
+            const returnEnCurso = ['RETURN_REQUESTED', 'IN_PROGRESS', 'RETURN_FAILED'].includes(order.returnStatus);
+            const noVolvioLaMercaderia = refundItem.restockType === 'NO_RESTOCK';
+            if (returnEnCurso || noVolvioLaMercaderia) {
+              devolucionesEnCurso.push({
+                orderName: order.name,
+                sku: item.sku || 'SIN_SKU',
+                title: item.title,
+                variantTitle: item.variantTitle || '',
+                quantity: refundItem.quantity,
+                motivo: returnEnCurso ? `Devolución en curso (${order.returnStatus})` : 'La mercadería todavía no se repuso',
+              });
+              return;
+            }
+
             // Omitir reembolsos de artículos unfulfilled (no preparados) y que fueron eliminados (currentQuantity = 0)
             const isFulfilledOrPOS = !!fulfilledItemMap[item.id] || !!orderLoc;
             const currentQty = itemCurrentQuantityMap[item.id];
@@ -780,6 +801,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
       details: vendorAggregates,
       missingCosts,
       skippedFulfillmentLines,
+      devolucionesEnCurso,
     });
   } catch (error) {
     console.error('Error al procesar liquidaciones:', error.message);
