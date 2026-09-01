@@ -225,7 +225,7 @@ app.post('/api/verify-connection', async (req, res) => {
 
 // Version del codigo en ejecucion y ultimo diagnostico, para poder verificar que el servidor
 // desplegado sea el que corresponde sin tener que entrar a los logs del hosting.
-const VERSION_APP = '2026-09-01-f';
+const VERSION_APP = '2026-09-01-g';
 let ultimoDiagnostico = { generado: null, resumen: 'Todavia no se genero ninguna liquidacion en este servidor.' };
 
 app.get('/api/version', (req, res) => {
@@ -451,6 +451,8 @@ app.post('/api/fetch-settlements', async (req, res) => {
     const lineasRecuperadas = [];
     // Control final: artículos que Shopify da por despachados y no quedaron liquidados.
     const articulosNoLiquidados = [];
+    // Devoluciones que se descuentan aunque Shopify no haya repuesto el articulo al stock.
+    const devolucionesSinReposicion = [];
 
     const registerItemRecord = (brand, item, quantity, date, orderName, type, hasCostInShopify, unitCostShopify, salePrice, paymentStatus, location) => {
       
@@ -845,22 +847,37 @@ app.post('/api/fetch-settlements', async (req, res) => {
             // no son devoluciones reales, el proveedor conserva la venta del articulo que si se despacho.
             if (refundItem.restockType === 'CANCEL') return;
 
-            // Una devolución se descuenta reción cuando la mercadería VOLVIÓ. Mientras el cambio
-            // está en curso (el cliente pidió la devolución pero la prenda todavía no se repuso),
-            // la venta se mantiene como venta normal y la nota de crédito espera al mes en que
-            // la devolución se cierre.
+            // Una devolución se descuenta recién cuando el cambio se cerró. Mientras la
+            // devolución está EN CURSO —el cliente la pidió pero todavía no se resolvió— la
+            // venta se mantiene como venta normal y la nota de crédito espera al mes en que
+            // se cierre.
+            //
+            // Importante: NO se mira si Shopify repuso el artículo al stock. En esta operación
+            // nunca se le devuelve la plata al cliente antes de recibir la prenda, así que un
+            // reembolso hecho significa que la mercadería volvió, se haya repuesto al inventario
+            // o no (por ejemplo si volvió fallada).
             const returnEnCurso = ['RETURN_REQUESTED', 'IN_PROGRESS', 'RETURN_FAILED'].includes(order.returnStatus);
-            const noVolvioLaMercaderia = refundItem.restockType === 'NO_RESTOCK';
-            if (returnEnCurso || noVolvioLaMercaderia) {
+            if (returnEnCurso) {
               devolucionesEnCurso.push({
                 orderName: order.name,
                 sku: item.sku || 'SIN_SKU',
                 title: item.title,
                 variantTitle: item.variantTitle || '',
                 quantity: refundItem.quantity,
-                motivo: returnEnCurso ? `Devolución en curso (${order.returnStatus})` : 'La mercadería todavía no se repuso',
+                motivo: `Devolución en curso (${order.returnStatus})`,
               });
               return;
+            }
+
+            if (refundItem.restockType === 'NO_RESTOCK') {
+              devolucionesSinReposicion.push({
+                orderName: order.name,
+                sku: item.sku || 'SIN_SKU',
+                title: item.title,
+                variantTitle: item.variantTitle || '',
+                quantity: refundItem.quantity,
+                nota: 'Se descuenta igual: hubo reembolso, pero Shopify no repuso el articulo al stock',
+              });
             }
 
             // Omitir reembolsos de artículos unfulfilled (no preparados) y que fueron eliminados (currentQuantity = 0)
@@ -914,7 +931,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
       pedidosTraidos: allOrders.length,
       lineasRecuperadas,
       articulosNoLiquidados,
-      articulosNoLiquidados,
+      devolucionesSinReposicion,
       skippedFulfillmentLines,
       pedidosSinLiquidar,
       devolucionesEnCurso,
@@ -945,8 +962,10 @@ app.post('/api/fetch-settlements', async (req, res) => {
       missingCosts,
       skippedFulfillmentLines,
       devolucionesEnCurso,
+      devolucionesSinReposicion,
       pedidosSinLiquidar,
       lineasRecuperadas,
+      articulosNoLiquidados,
     });
   } catch (error) {
     console.error('Error al procesar liquidaciones:', error.message);
