@@ -435,6 +435,8 @@ app.post('/api/fetch-settlements', async (req, res) => {
     const skippedFulfillmentLines = [];
     // Devoluciones que todavía no se descuentan porque el cambio no se cerró.
     const devolucionesEnCurso = [];
+    // Pedidos con despachos en el período que no generaron ninguna venta.
+    const pedidosSinLiquidar = [];
 
     const registerItemRecord = (brand, item, quantity, date, orderName, type, hasCostInShopify, unitCostShopify, salePrice, paymentStatus, location) => {
       
@@ -640,6 +642,10 @@ app.post('/api/fetch-settlements', async (req, res) => {
           lineItemById[edge.node.id] = edge.node;
         });
 
+        // Diagnóstico: qué despachos del período vio la app en este pedido y qué hizo con ellos.
+        const despachosEnPeriodo = [];
+        const registrosAntes = Object.values(vendorAggregates).reduce((n, v) => n + v.items.length, 0);
+
         // Artículos que salen por algún despacho, en cualquier fecha. Los de esta lista no
         // se vuelven a tomar por la rama de local, para no contarlos dos veces.
         const itemsConDespacho = new Set();
@@ -666,6 +672,20 @@ app.post('/api/fetch-settlements', async (req, res) => {
 
           const fulfillmentLoc = f.location?.name || 'Sin Ubicación';
           const fItems = f.fulfillmentLineItems?.edges || [];
+
+          despachosEnPeriodo.push({
+            fulfillmentId: f.id,
+            fecha: f.createdAt,
+            estado: f.status || '(sin estado)',
+            sucursal: fulfillmentLoc,
+            lineas: fItems.map((e) => ({
+              lineItemId: e.node.lineItem?.id || null,
+              estaEnElPedido: !!lineItemById[e.node.lineItem?.id],
+              titulo: e.node.lineItem?.title || null,
+              vendor: e.node.lineItem?.vendor || null,
+              cantidad: e.node.quantity,
+            })),
+          });
 
           fItems.forEach((fEdge) => {
             const fLine = fEdge.node;
@@ -712,6 +732,13 @@ app.post('/api/fetch-settlements', async (req, res) => {
               registerItemRecord(brand, item, item.quantity, order.processedAt, order.name, 'Venta', hasCostInShopify, unitCost, salePrice, order.displayFinancialStatus, orderLoc);
             });
           }
+        }
+
+        // Si el pedido tuvo despachos dentro del período pero no generó ninguna venta,
+        // algo se está perdiendo. Se guarda el detalle para poder verlo.
+        const registrosDespues = Object.values(vendorAggregates).reduce((n, v) => n + v.items.length, 0);
+        if (despachosEnPeriodo.length > 0 && registrosDespues === registrosAntes) {
+          pedidosSinLiquidar.push({ orderName: order.name, despachos: despachosEnPeriodo });
         }
       }
 
@@ -794,6 +821,19 @@ app.post('/api/fetch-settlements', async (req, res) => {
       };
     });
 
+    if (skippedFulfillmentLines.length) {
+      console.log('=== ARTICULOS DESPACHADOS QUE NO SE PUDIERON LIQUIDAR ===');
+      console.log(JSON.stringify(skippedFulfillmentLines, null, 2));
+    }
+    if (pedidosSinLiquidar.length) {
+      console.log('=== PEDIDOS CON DESPACHOS EN EL PERIODO QUE NO GENERARON NINGUNA VENTA ===');
+      console.log(JSON.stringify(pedidosSinLiquidar, null, 2));
+    }
+    if (devolucionesEnCurso.length) {
+      console.log('=== DEVOLUCIONES EN CURSO (no se descontaron) ===');
+      console.log(devolucionesEnCurso.map((d) => `${d.orderName} ${d.sku} x${d.quantity} - ${d.motivo}`).join('\n'));
+    }
+
     res.json({
       success: true,
       ordersCount: allOrders.length,
@@ -802,6 +842,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
       missingCosts,
       skippedFulfillmentLines,
       devolucionesEnCurso,
+      pedidosSinLiquidar,
     });
   } catch (error) {
     console.error('Error al procesar liquidaciones:', error.message);
