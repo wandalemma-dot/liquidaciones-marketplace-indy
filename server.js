@@ -628,30 +628,23 @@ app.post('/api/fetch-settlements', async (req, res) => {
         return { unitCost: 0, hasCostInShopify: false };
       };
 
-      if (orderLoc) {
-        // Venta de local (POS): no genera despacho, se toma por la fecha del pedido.
-        const orderProcessedTime = new Date(order.processedAt).getTime();
-        if (orderProcessedTime >= startDateTime && orderProcessedTime <= endDateTime) {
-          lineItemsList.forEach((edge) => {
-            const item = edge.node;
-
-            // Omitir artículos que fueron eliminados de la orden (currentQuantity = 0)
-            if (itemCurrentQuantityMap[item.id] === 0) {
-              return;
-            }
-
-            const brand = normalizeBrand(item.vendor, item.title);
-            const salePrice = parseFloat(item.originalUnitPriceSet?.shopMoney?.amount || 0);
-            const { unitCost, hasCostInShopify } = extractCost(item);
-
-            registerItemRecord(brand, item, item.quantity, order.processedAt, order.name, 'Venta', hasCostInShopify, unitCost, salePrice, order.displayFinancialStatus, orderLoc);
-          });
-        }
-      } else {
-        // Venta online: se recorren los despachos, no los artículos del pedido.
+      {
+        // Los despachos se recorren SIEMPRE, tenga el pedido sucursal asignada o no. Antes,
+        // si el pedido tenía sucursal (venta de local o pedido preliminar asignado a un
+        // depósito) se ignoraban sus despachos y se caían artículos ya enviados.
         const lineItemById = {};
         lineItemsList.forEach((edge) => {
           lineItemById[edge.node.id] = edge.node;
+        });
+
+        // Artículos que salen por algún despacho, en cualquier fecha. Los de esta lista no
+        // se vuelven a tomar por la rama de local, para no contarlos dos veces.
+        const itemsConDespacho = new Set();
+        (order.fulfillments || []).forEach((f) => {
+          (f.fulfillmentLineItems?.edges || []).forEach((fEdge) => {
+            const id = fEdge.node.lineItem?.id;
+            if (id) itemsConDespacho.add(id);
+          });
         });
 
         (order.fulfillments || []).forEach((f) => {
@@ -694,6 +687,29 @@ app.post('/api/fetch-settlements', async (req, res) => {
             registerItemRecord(brand, item, quantity, f.createdAt, order.name, 'Venta', hasCostInShopify, unitCost, salePrice, order.displayFinancialStatus, fulfillmentLoc);
           });
         });
+
+        // Venta de local (POS): los artículos que se entregan en el momento no generan
+        // despacho, así que esos —y solo esos— se toman por la fecha del pedido.
+        if (orderLoc) {
+          const orderProcessedTime = new Date(order.processedAt).getTime();
+          if (orderProcessedTime >= startDateTime && orderProcessedTime <= endDateTime) {
+            lineItemsList.forEach((edge) => {
+              const item = edge.node;
+
+              // Ya contado más arriba por su despacho
+              if (itemsConDespacho.has(item.id)) return;
+
+              // Omitir artículos que fueron eliminados de la orden (currentQuantity = 0)
+              if (itemCurrentQuantityMap[item.id] === 0) return;
+
+              const brand = normalizeBrand(item.vendor, item.title);
+              const salePrice = parseFloat(item.originalUnitPriceSet?.shopMoney?.amount || 0);
+              const { unitCost, hasCostInShopify } = extractCost(item);
+
+              registerItemRecord(brand, item, item.quantity, order.processedAt, order.name, 'Venta', hasCostInShopify, unitCost, salePrice, order.displayFinancialStatus, orderLoc);
+            });
+          }
+        }
       }
 
       const refunds = order.refunds || [];
