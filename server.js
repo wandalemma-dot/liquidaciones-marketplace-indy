@@ -225,7 +225,9 @@ app.post('/api/verify-connection', async (req, res) => {
 
 // Version del codigo en ejecucion y ultimo diagnostico, para poder verificar que el servidor
 // desplegado sea el que corresponde sin tener que entrar a los logs del hosting.
-const VERSION_APP = '2026-09-01-g';
+const VERSION_APP = '2026-09-01-h';
+// Pedidos a trazar en detalle en el diagnostico, para investigar casos puntuales.
+const PEDIDOS_A_VIGILAR = (process.env.PEDIDOS_A_VIGILAR || '#207050').split(',').map((x) => x.trim()).filter(Boolean);
 let ultimoDiagnostico = { generado: null, resumen: 'Todavia no se genero ninguna liquidacion en este servidor.' };
 
 app.get('/api/version', (req, res) => {
@@ -453,6 +455,8 @@ app.post('/api/fetch-settlements', async (req, res) => {
     const articulosNoLiquidados = [];
     // Devoluciones que se descuentan aunque Shopify no haya repuesto el articulo al stock.
     const devolucionesSinReposicion = [];
+    // Traza completa de los pedidos vigilados: todo lo que la app ve de ellos.
+    const pedidosVigilados = [];
 
     const registerItemRecord = (brand, item, quantity, date, orderName, type, hasCostInShopify, unitCostShopify, salePrice, paymentStatus, location) => {
       
@@ -586,6 +590,36 @@ app.post('/api/fetch-settlements', async (req, res) => {
     };
 
     allOrders.forEach((order) => {
+      if (PEDIDOS_A_VIGILAR.includes(order.name)) {
+        pedidosVigilados.push({
+          orderName: order.name,
+          creado: order.createdAt,
+          procesado: order.processedAt,
+          cancelado: order.cancelledAt,
+          estadoPago: order.displayFinancialStatus,
+          estadoPreparacion: order.displayFulfillmentStatus,
+          estadoDevolucion: order.returnStatus,
+          sucursalDelPedido: order.retailLocation?.name || null,
+          articulos: (order.lineItems?.edges || []).map((e) => ({
+            id: e.node.id, sku: e.node.sku, titulo: e.node.title, vendor: e.node.vendor,
+            cantidad: e.node.quantity, actual: e.node.currentQuantity, sinDespachar: e.node.unfulfilledQuantity,
+          })),
+          despachos: (order.fulfillments || []).map((f) => ({
+            id: f.id, fecha: f.createdAt, estado: f.status, sucursal: f.location?.name || null,
+            lineas: (f.fulfillmentLineItems?.edges || []).map((e) => ({
+              lineItemId: e.node.lineItem?.id || null, sku: e.node.lineItem?.sku || null,
+              titulo: e.node.lineItem?.title || null, cantidad: e.node.quantity,
+            })),
+          })),
+          reembolsos: (order.refunds || []).map((r) => ({
+            id: r.id, fecha: r.createdAt,
+            lineas: (r.refundLineItems?.edges || []).map((e) => ({
+              sku: e.node.lineItem?.sku || null, cantidad: e.node.quantity, restockType: e.node.restockType,
+            })),
+          })),
+        });
+      }
+
       // Ignorar pedidos cancelados completamente para evitar deducciones incorrectas
       if (order.cancelledAt) {
         return;
@@ -813,6 +847,9 @@ app.post('/api/fetch-settlements', async (req, res) => {
         if (despachosEnPeriodo.length > 0) {
           lineItemsList.forEach((edge) => {
             const item = edge.node;
+            // Si el articulo aparece en algun despacho (aunque sea de otro mes), su lugar ya
+            // esta definido y no corresponde marcarlo como faltante de este periodo.
+            if (itemsConDespacho.has(item.id)) return;
             const despachado = (item.quantity || 0) - (item.unfulfilledQuantity ?? item.quantity ?? 0);
             const liquidado = registradoPorItem[item.id] || 0;
             if (despachado > liquidado) {
@@ -932,6 +969,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
       lineasRecuperadas,
       articulosNoLiquidados,
       devolucionesSinReposicion,
+      pedidosVigilados,
       skippedFulfillmentLines,
       pedidosSinLiquidar,
       devolucionesEnCurso,
@@ -963,6 +1001,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
       skippedFulfillmentLines,
       devolucionesEnCurso,
       devolucionesSinReposicion,
+      pedidosVigilados,
       pedidosSinLiquidar,
       lineasRecuperadas,
       articulosNoLiquidados,
