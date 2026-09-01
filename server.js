@@ -223,6 +223,15 @@ app.post('/api/verify-connection', async (req, res) => {
   }
 });
 
+// Version del codigo en ejecucion y ultimo diagnostico, para poder verificar que el servidor
+// desplegado sea el que corresponde sin tener que entrar a los logs del hosting.
+const VERSION_APP = '2026-09-01-e';
+let ultimoDiagnostico = { generado: null, resumen: 'Todavia no se genero ninguna liquidacion en este servidor.' };
+
+app.get('/api/version', (req, res) => {
+  res.json({ version: VERSION_APP, diagnostico: ultimoDiagnostico });
+});
+
 // 4. Endpoint para obtener pedidos y calcular pre-liquidaciones (Soporta Devoluciones y Descuentos)
 app.post('/api/fetch-settlements', async (req, res) => {
   const { storeUrl, accessToken, startDate, endDate, financialStatus, fulfillmentStatus, brandDiscounts = {} } = req.body;
@@ -652,10 +661,16 @@ app.post('/api/fetch-settlements', async (req, res) => {
         // Artículos que salen por algún despacho, en cualquier fecha. Los de esta lista no
         // se vuelven a tomar por la rama de local, para no contarlos dos veces.
         const itemsConDespacho = new Set();
+        // OJO: solo cuentan los despachos de los que efectivamente se pueden leer los datos
+        // del artículo. Si el despacho trae la referencia pero vacía —lo que pasa cuando el
+        // pedido se editó después de enviarse— NO se marca como cubierto, porque si no el
+        // rescate de más abajo nunca se activaría justo en el caso para el que existe.
         (order.fulfillments || []).forEach((f) => {
           (f.fulfillmentLineItems?.edges || []).forEach((fEdge) => {
-            const id = fEdge.node.lineItem?.id;
-            if (id) itemsConDespacho.add(id);
+            const ref = fEdge.node.lineItem;
+            if (!ref?.id) return;
+            const resuelto = lineItemById[ref.id] || ref;
+            if (resuelto && (resuelto.title || resuelto.sku)) itemsConDespacho.add(ref.id);
           });
         });
 
@@ -855,6 +870,16 @@ app.post('/api/fetch-settlements', async (req, res) => {
         itemsCount: v.items.length,
       };
     });
+
+    ultimoDiagnostico = {
+      generado: new Date().toISOString(),
+      periodo: `${startDate} a ${endDate}`,
+      pedidosTraidos: allOrders.length,
+      lineasRecuperadas,
+      skippedFulfillmentLines,
+      pedidosSinLiquidar,
+      devolucionesEnCurso,
+    };
 
     if (skippedFulfillmentLines.length) {
       console.log('=== ARTICULOS DESPACHADOS QUE NO SE PUDIERON LIQUIDAR ===');
