@@ -225,7 +225,7 @@ app.post('/api/verify-connection', async (req, res) => {
 
 // Version del codigo en ejecucion y ultimo diagnostico, para poder verificar que el servidor
 // desplegado sea el que corresponde sin tener que entrar a los logs del hosting.
-const VERSION_APP = '2026-09-01-h';
+const VERSION_APP = '2026-09-02-i';
 // Pedidos a trazar en detalle en el diagnostico, para investigar casos puntuales.
 const PEDIDOS_A_VIGILAR = (process.env.PEDIDOS_A_VIGILAR || '#207050').split(',').map((x) => x.trim()).filter(Boolean);
 let ultimoDiagnostico = { generado: null, resumen: 'Todavia no se genero ninguna liquidacion en este servidor.' };
@@ -248,11 +248,15 @@ app.post('/api/fetch-settlements', async (req, res) => {
     // a las 22:00 (01:00 UTC del 1/9) se escapaba del período.
     const TZ_OFFSET = '-03:00';
 
-    // Se traen los pedidos creados en el período MÁS todos los actualizados desde el inicio del
-    // período, sin tope superior: un pedido de julio despachado en agosto puede haberse vuelto a
-    // actualizar en septiembre y aun así su despacho pertenece a agosto. El recorte real por
-    // fecha de despacho se hace más abajo, en código.
-    let queryFilters = `(created_at:>=${startDate}T00:00:00${TZ_OFFSET} AND created_at:<=${endDate}T23:59:59${TZ_OFFSET}) OR (updated_at:>=${startDate}T00:00:00${TZ_OFFSET})`;
+    // Los límites se mandan a Shopify en UTC puro (terminados en Z). Antes se mandaban con el
+    // desfasaje "-03:00" adentro de la búsqueda y el buscador de Shopify no lo interpretaba
+    // bien: se quedaban afuera pedidos que sí correspondían al mes (por ejemplo el #207050).
+    const inicioUTC = new Date(`${startDate}T00:00:00${TZ_OFFSET}`).toISOString();
+
+    // Un solo criterio, sin paréntesis ni OR: todo pedido que tenga algo que ver con el mes
+    // (creado, despachado, devuelto o editado) quedó actualizado a partir del inicio del período.
+    // El recorte fino por fecha de despacho se hace más abajo, en código.
+    let queryFilters = `updated_at:>=${inicioUTC}`;
 
     if (financialStatus && financialStatus !== 'any') {
       queryFilters += ` AND financial_status:${financialStatus}`;
