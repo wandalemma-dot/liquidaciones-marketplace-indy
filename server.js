@@ -225,7 +225,7 @@ app.post('/api/verify-connection', async (req, res) => {
 
 // Version del codigo en ejecucion y ultimo diagnostico, para poder verificar que el servidor
 // desplegado sea el que corresponde sin tener que entrar a los logs del hosting.
-const VERSION_APP = '2026-09-02-i';
+const VERSION_APP = '2026-09-02-j';
 // Pedidos a trazar en detalle en el diagnostico, para investigar casos puntuales.
 const PEDIDOS_A_VIGILAR = (process.env.PEDIDOS_A_VIGILAR || '#207050').split(',').map((x) => x.trim()).filter(Boolean);
 let ultimoDiagnostico = { generado: null, resumen: 'Todavia no se genero ninguna liquidacion en este servidor.' };
@@ -792,7 +792,15 @@ app.post('/api/fetch-settlements', async (req, res) => {
             const item = edge.node;
             if (itemsConDespacho.has(item.id)) return;
 
-            const cantidadDespachada = (item.quantity || 0) - (item.unfulfilledQuantity ?? item.quantity ?? 0);
+            // Un articulo ELIMINADO del pedido (lo que Shopify muestra como "Eliminado" cuando
+            // se edito la orden) queda con currentQuantity en 0 y, como no esta pendiente de
+            // envio, su unfulfilledQuantity tambien es 0. Sin este tope, el rescate lo tomaba
+            // como despachado y liquidaba una prenda que en realidad nunca salio.
+            const activo = item.currentQuantity ?? item.quantity ?? 0;
+            const cantidadDespachada = Math.min(
+              (item.quantity || 0) - (item.unfulfilledQuantity ?? item.quantity ?? 0),
+              activo
+            );
             if (cantidadDespachada <= 0) return;
 
             const brand = normalizeBrand(item.vendor, item.title);
