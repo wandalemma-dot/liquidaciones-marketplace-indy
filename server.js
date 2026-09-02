@@ -225,7 +225,7 @@ app.post('/api/verify-connection', async (req, res) => {
 
 // Version del codigo en ejecucion y ultimo diagnostico, para poder verificar que el servidor
 // desplegado sea el que corresponde sin tener que entrar a los logs del hosting.
-const VERSION_APP = '2026-09-02-o';
+const VERSION_APP = '2026-09-02-p';
 // Pedidos a trazar en detalle en el diagnostico, para investigar casos puntuales.
 // Fecha desde la que rige el criterio de FECHA DE PREPARACION. Los pedidos anteriores a esta
 // fecha ya se liquidaron en su momento con el criterio viejo (fecha del pedido), asi que sus
@@ -1147,14 +1147,21 @@ app.post('/api/export-excel', async (req, res) => {
     const summarySheet = workbook.addWorksheet('Resumen General');
     summarySheet.views = [{ showGridLines: true }];
 
-    summarySheet.mergeCells('A1:E1');
+    // Regla del 3% por transferencia: la misma que se aplica en las hojas "Agr -".
+    // x Brand & Co no lo lleva (arreglo con Wanda: no durante sus primeros meses).
+    const llevaDescuentoTransferencia = (nombreMarca) => {
+      const m = (nombreMarca || '').toUpperCase();
+      return !(m.includes('BRAND & CO') || m.includes('BRAND&CO'));
+    };
+
+    summarySheet.mergeCells('A1:I1');
     const titleCell = summarySheet.getCell('A1');
     titleCell.value = 'RESUMEN GENERAL DE LIQUIDACIONES';
     titleCell.font = { name: 'Segoe UI', size: 16, bold: true, color: { argb: 'FF0F172A' } };
     titleCell.alignment = { vertical: 'middle', horizontal: 'left' };
     summarySheet.getRow(1).height = 40;
 
-    summarySheet.mergeCells('A2:E2');
+    summarySheet.mergeCells('A2:I2');
     const periodCell = summarySheet.getCell('A2');
     periodCell.value = `Periodo consultado: ${period || 'N/A'}`;
     periodCell.font = { name: 'Segoe UI', size: 10, italic: true, color: { argb: 'FF475569' } };
@@ -1168,11 +1175,15 @@ app.post('/api/export-excel', async (req, res) => {
       'Ventas netas',
       'Costo de los bienes vendidos (Original)',
       'Costo de los bienes vendidos (Neto)',
+      'IVA 21%',
+      'TOTAL',
+      'DTO. 3% PAGO POR TRANSF.',
+      'TOTAL A TRANSFERIR',
     ];
     summarySheet.getRow(4).values = summaryHeaders;
     summarySheet.getRow(4).height = 28;
-    
-    for (let col = 1; col <= 5; col++) {
+
+    for (let col = 1; col <= 9; col++) {
       const cell = summarySheet.getCell(4, col);
       cell.fill = headerFill;
       cell.font = headerFont;
@@ -1180,24 +1191,57 @@ app.post('/api/export-excel', async (req, res) => {
       cell.border = borderStyle;
     }
 
+    // El resumen ahora cierra la cuenta de cada marca igual que su hoja "Agr -":
+    // costo neto -> IVA -> TOTAL -> descuento por transferencia -> TOTAL A TRANSFERIR.
+    // Los importes se escriben como NUMEROS, no como formulas: Excel no calcula formulas
+    // mientras el archivo esta en "Vista protegida" y la fila de totales aparecia vacia.
+    const FILL_TRANSFERIR = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFDE047' } };
+    const FILL_DESCUENTO = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF5EEAD4' } };
+
     let startRow = 5;
+    const acumulado = { cantidad: 0, ventas: 0, original: 0, neto: 0, iva: 0, total: 0, descuento: 0, aTransferir: 0 };
+
     summary.forEach((row, index) => {
       const currentRowNum = startRow + index;
+
+      const neto = row.totalCost || 0;
+      const iva = neto * 0.21;
+      const total = neto + iva;
+      const descuento = llevaDescuentoTransferencia(row.brandName) ? total * -0.03 : 0;
+      const aTransferir = total + descuento;
+
+      acumulado.cantidad += row.totalQuantity || 0;
+      acumulado.ventas += row.totalSales || 0;
+      acumulado.original += row.totalCostOriginal || 0;
+      acumulado.neto += neto;
+      acumulado.iva += iva;
+      acumulado.total += total;
+      acumulado.descuento += descuento;
+      acumulado.aTransferir += aTransferir;
+
       summarySheet.getRow(currentRowNum).values = [
         row.brandName,
         row.totalQuantity,
         row.totalSales,
         row.totalCostOriginal,
-        row.totalCost,
+        neto,
+        iva,
+        total,
+        descuento,
+        aTransferir,
       ];
       summarySheet.getRow(currentRowNum).height = 22;
 
-      for (let col = 1; col <= 5; col++) {
+      for (let col = 1; col <= 9; col++) {
         const cell = summarySheet.getCell(currentRowNum, col);
-        cell.font = { name: 'Segoe UI', size: 10 };
+        cell.font = { name: 'Segoe UI', size: 10, bold: col === 9 };
         cell.border = borderStyle;
-        
-        if (currentRowNum % 2 === 0) {
+
+        if (col === 9) {
+          cell.fill = FILL_TRANSFERIR;
+        } else if (col === 8) {
+          cell.fill = FILL_DESCUENTO;
+        } else if (currentRowNum % 2 === 0) {
           cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } };
         }
 
@@ -1217,17 +1261,21 @@ app.post('/api/export-excel', async (req, res) => {
     summarySheet.getRow(totalRowNum).height = 25;
     summarySheet.getRow(totalRowNum).values = [
       'TOTAL GENERAL',
-      { formula: `SUM(B${startRow}:B${totalRowNum-1})` },
-      { formula: `SUM(C${startRow}:C${totalRowNum-1})` },
-      { formula: `SUM(D${startRow}:D${totalRowNum-1})` },
-      { formula: `SUM(E${startRow}:E${totalRowNum-1})` },
+      acumulado.cantidad,
+      acumulado.ventas,
+      acumulado.original,
+      acumulado.neto,
+      acumulado.iva,
+      acumulado.total,
+      acumulado.descuento,
+      acumulado.aTransferir,
     ];
 
-    for (let col = 1; col <= 5; col++) {
+    for (let col = 1; col <= 9; col++) {
       const cell = summarySheet.getCell(totalRowNum, col);
       cell.font = { name: 'Segoe UI', size: 11, bold: true, color: { argb: 'FF0F172A' } };
       cell.border = doubleBottomBorder;
-      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF1F5F9' } };
+      cell.fill = col === 9 ? FILL_TRANSFERIR : { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF1F5F9' } };
 
       if (col === 1) {
         cell.alignment = { vertical: 'middle', horizontal: 'left' };
@@ -1240,13 +1288,32 @@ app.post('/api/export-excel', async (req, res) => {
       }
     }
 
+    // Linea final, bien visible: la plata que hay que pagar en total este periodo.
+    const filaPagar = totalRowNum + 2;
+    summarySheet.getRow(filaPagar).height = 32;
+    summarySheet.mergeCells(`A${filaPagar}:H${filaPagar}`);
+    const celdaEtiqueta = summarySheet.getCell(`A${filaPagar}`);
+    celdaEtiqueta.value = 'TOTAL A PAGAR (todas las marcas)';
+    celdaEtiqueta.font = { name: 'Segoe UI', size: 12, bold: true, color: { argb: 'FF0F172A' } };
+    celdaEtiqueta.alignment = { vertical: 'middle', horizontal: 'right' };
+    celdaEtiqueta.fill = FILL_TRANSFERIR;
+    const celdaPagar = summarySheet.getCell(`I${filaPagar}`);
+    celdaPagar.value = acumulado.aTransferir;
+    celdaPagar.font = { name: 'Segoe UI', size: 12, bold: true, color: { argb: 'FF0F172A' } };
+    celdaPagar.alignment = { vertical: 'middle', horizontal: 'right' };
+    celdaPagar.numFormat = '$#,##0.00';
+    celdaPagar.fill = FILL_TRANSFERIR;
+    celdaPagar.border = doubleBottomBorder;
+
     summarySheet.getColumn(1).width = 30;
     summarySheet.getColumn(2).width = 18;
     summarySheet.getColumn(3).width = 22;
     summarySheet.getColumn(4).width = 32;
     summarySheet.getColumn(5).width = 32;
-    summarySheet.getColumn(6).width = 22;
-    summarySheet.getColumn(7).width = 15;
+    summarySheet.getColumn(6).width = 18;
+    summarySheet.getColumn(7).width = 20;
+    summarySheet.getColumn(8).width = 24;
+    summarySheet.getColumn(9).width = 24;
 
     // HOJAS POR MARCA
     // Excel no permite dos hojas con el mismo nombre (y NO distingue mayus/minus).
