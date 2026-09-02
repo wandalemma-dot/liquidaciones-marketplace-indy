@@ -225,7 +225,7 @@ app.post('/api/verify-connection', async (req, res) => {
 
 // Version del codigo en ejecucion y ultimo diagnostico, para poder verificar que el servidor
 // desplegado sea el que corresponde sin tener que entrar a los logs del hosting.
-const VERSION_APP = '2026-09-02-m';
+const VERSION_APP = '2026-09-02-n';
 // Pedidos a trazar en detalle en el diagnostico, para investigar casos puntuales.
 // Fecha desde la que rige el criterio de FECHA DE PREPARACION. Los pedidos anteriores a esta
 // fecha ya se liquidaron en su momento con el criterio viejo (fecha del pedido), asi que sus
@@ -465,6 +465,8 @@ app.post('/api/fetch-settlements', async (req, res) => {
     const devolucionesSinReposicion = [];
     // Traza completa de los pedidos vigilados: todo lo que la app ve de ellos.
     const pedidosVigilados = [];
+    // Notas de credito que no se descuentan porque su reemplazo tampoco se liquida.
+    const notasDeCreditoOmitidas = [];
     // Articulos despachados en el periodo que pertenecen a pedidos anteriores al corte: no se
     // liquidan (ya se pagaron en su mes) pero se informan para poder revisarlos a mano.
     const articulosDePedidosAnterioresAlCorte = [];
@@ -689,6 +691,15 @@ app.post('/api/fetch-settlements', async (req, res) => {
       // ============================================================================
 
       const pedidoAnteriorAlCorte = new Date(order.processedAt).getTime() < corteCriterio;
+
+      // ¿Salió alguna prenda de este pedido dentro del período? En un pedido anterior al corte
+      // eso significa que hubo un reemplazo (cambio o reposición por falla) que NO se liquida
+      // porque la venta original ya se pagó en su mes.
+      const tuvoDespachoEnElPeriodo = (order.fulfillments || []).some((f) => {
+        const t = new Date(f.createdAt).getTime();
+        if (isNaN(t) || t < startDateTime || t > endDateTime) return false;
+        return !['CANCELLED', 'CANCELED', 'ERROR', 'FAILURE'].includes((f.status || '').toUpperCase());
+      });
 
       const extractCost = (item) => {
         if (item.variant?.inventoryItem?.unitCost?.amount) {
@@ -932,6 +943,23 @@ app.post('/api/fetch-settlements', async (req, res) => {
             // nunca se le devuelve la plata al cliente antes de recibir la prenda, así que un
             // reembolso hecho significa que la mercadería volvió, se haya repuesto al inventario
             // o no (por ejemplo si volvió fallada).
+            // Pedido anterior al corte que ademas despacho un reemplazo en el periodo: la venta
+            // original ya se pago en su mes y el reemplazo no se vuelve a cobrar, asi que la nota
+            // de credito tampoco corresponde. Van las dos juntas o ninguna. (Caso #205479: buzo
+            // devuelto por falla y repuesto por otro igual.) Si el pedido viejo NO despacho nada
+            // en el periodo, fue una devolucion sin reemplazo y la nota SI se descuenta.
+            if (pedidoAnteriorAlCorte && tuvoDespachoEnElPeriodo) {
+              notasDeCreditoOmitidas.push({
+                orderName: order.name,
+                sku: item.sku || 'SIN_SKU',
+                title: item.title,
+                variantTitle: item.variantTitle || '',
+                quantity: refundItem.quantity,
+                motivo: 'Pedido anterior al corte con reemplazo despachado: el reemplazo no se liquida, la nota tampoco',
+              });
+              return;
+            }
+
             const returnEnCurso = ['RETURN_REQUESTED', 'IN_PROGRESS', 'RETURN_FAILED'].includes(order.returnStatus);
             if (returnEnCurso) {
               devolucionesEnCurso.push({
@@ -1008,6 +1036,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
       lineasRecuperadas,
       articulosNoLiquidados,
       articulosDePedidosAnterioresAlCorte,
+      notasDeCreditoOmitidas,
       devolucionesSinReposicion,
       pedidosVigilados,
       skippedFulfillmentLines,
@@ -1042,6 +1071,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
       devolucionesEnCurso,
       devolucionesSinReposicion,
       articulosDePedidosAnterioresAlCorte,
+      notasDeCreditoOmitidas,
       pedidosVigilados,
       pedidosSinLiquidar,
       lineasRecuperadas,
