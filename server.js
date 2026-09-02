@@ -225,7 +225,7 @@ app.post('/api/verify-connection', async (req, res) => {
 
 // Version del codigo en ejecucion y ultimo diagnostico, para poder verificar que el servidor
 // desplegado sea el que corresponde sin tener que entrar a los logs del hosting.
-const VERSION_APP = '2026-09-02-n';
+const VERSION_APP = '2026-09-02-o';
 // Pedidos a trazar en detalle en el diagnostico, para investigar casos puntuales.
 // Fecha desde la que rige el criterio de FECHA DE PREPARACION. Los pedidos anteriores a esta
 // fecha ya se liquidaron en su momento con el criterio viejo (fecha del pedido), asi que sus
@@ -695,11 +695,28 @@ app.post('/api/fetch-settlements', async (req, res) => {
       // ¿Salió alguna prenda de este pedido dentro del período? En un pedido anterior al corte
       // eso significa que hubo un reemplazo (cambio o reposición por falla) que NO se liquida
       // porque la venta original ya se pagó en su mes.
-      const tuvoDespachoEnElPeriodo = (order.fulfillments || []).some((f) => {
-        const t = new Date(f.createdAt).getTime();
-        if (isNaN(t) || t < startDateTime || t > endDateTime) return false;
-        return !['CANCELLED', 'CANCELED', 'ERROR', 'FAILURE'].includes((f.status || '').toUpperCase());
-      });
+      // OJO: no alcanza con mirar si el pedido despachó "algo". Un pedido puede tener prendas
+      // de varias marcas: si en agosto salió un reemplazo de la marca A, eso no dice nada sobre
+      // una devolución de la marca B del mismo pedido, y suprimir esa nota de crédito le hace
+      // pagar de más al proveedor B. (Caso #206107: la nota de FAMILYARG se estaba comiendo
+      // porque el pedido despachó un artículo de otra marca.) Por eso se guarda POR MARCA qué
+      // se despachó dentro del período.
+      const marcasConDespachoEnElPeriodo = new Set();
+      {
+        const porId = {};
+        lineItemsList.forEach((edge) => { porId[edge.node.id] = edge.node; });
+        (order.fulfillments || []).forEach((f) => {
+          const t = new Date(f.createdAt).getTime();
+          if (isNaN(t) || t < startDateTime || t > endDateTime) return;
+          if (['CANCELLED', 'CANCELED', 'ERROR', 'FAILURE'].includes((f.status || '').toUpperCase())) return;
+          (f.fulfillmentLineItems?.edges || []).forEach((fEdge) => {
+            const ref = fEdge.node.lineItem;
+            const resuelto = porId[ref?.id] || ref;
+            if (!resuelto || !(resuelto.title || resuelto.sku)) return;
+            marcasConDespachoEnElPeriodo.add(normalizeBrand(resuelto.vendor, resuelto.title));
+          });
+        });
+      }
 
       const extractCost = (item) => {
         if (item.variant?.inventoryItem?.unitCost?.amount) {
@@ -948,14 +965,20 @@ app.post('/api/fetch-settlements', async (req, res) => {
             // de credito tampoco corresponde. Van las dos juntas o ninguna. (Caso #205479: buzo
             // devuelto por falla y repuesto por otro igual.) Si el pedido viejo NO despacho nada
             // en el periodo, fue una devolucion sin reemplazo y la nota SI se descuenta.
-            if (pedidoAnteriorAlCorte && tuvoDespachoEnElPeriodo) {
+            //
+            // El reemplazo tiene que ser DE LA MISMA MARCA que lo devuelto. Si el pedido viejo
+            // despachó en el período algo de otra marca, para este proveedor fue una devolución
+            // sin reemplazo y la nota SÍ se descuenta.
+            const marcaDevuelta = normalizeBrand(item.vendor, item.title);
+            if (pedidoAnteriorAlCorte && marcasConDespachoEnElPeriodo.has(marcaDevuelta)) {
               notasDeCreditoOmitidas.push({
                 orderName: order.name,
                 sku: item.sku || 'SIN_SKU',
                 title: item.title,
                 variantTitle: item.variantTitle || '',
+                marca: marcaDevuelta,
                 quantity: refundItem.quantity,
-                motivo: 'Pedido anterior al corte con reemplazo despachado: el reemplazo no se liquida, la nota tampoco',
+                motivo: 'Pedido anterior al corte con reemplazo de la misma marca despachado: el reemplazo no se liquida, la nota tampoco',
               });
               return;
             }
