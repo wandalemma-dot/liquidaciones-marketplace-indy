@@ -225,12 +225,11 @@ app.post('/api/verify-connection', async (req, res) => {
 
 // Version del codigo en ejecucion y ultimo diagnostico, para poder verificar que el servidor
 // desplegado sea el que corresponde sin tener que entrar a los logs del hosting.
-const VERSION_APP = '2026-09-02-p';
+const VERSION_APP = '2026-09-03-a';
+// CRITERIO DE LIQUIDACION VIGENTE: FECHA DE PAGO del pedido. Si el cliente pago dentro del
+// periodo, el proveedor cobra todo lo que quedo en el pedido, este despachado o no. No hay
+// fecha de corte: cada pedido se paga una sola vez, en el mes en que entro la plata.
 // Pedidos a trazar en detalle en el diagnostico, para investigar casos puntuales.
-// Fecha desde la que rige el criterio de FECHA DE PREPARACION. Los pedidos anteriores a esta
-// fecha ya se liquidaron en su momento con el criterio viejo (fecha del pedido), asi que sus
-// articulos NO se vuelven a liquidar aunque se despachen despues: se pagarian dos veces.
-const CORTE_CRITERIO_DESPACHO = process.env.CORTE_CRITERIO_DESPACHO || '2026-08-01';
 const PEDIDOS_A_VIGILAR = (process.env.PEDIDOS_A_VIGILAR || '#207050').split(',').map((x) => x.trim()).filter(Boolean);
 let ultimoDiagnostico = { generado: null, resumen: 'Todavia no se genero ninguna liquidacion en este servidor.' };
 
@@ -272,10 +271,25 @@ app.post('/api/fetch-settlements', async (req, res) => {
     let hasNextPage = true;
     let cursor = null;
     let allOrders = [];
+    let incluirTransacciones = true;
+    let avisoTransacciones = null;
 
     console.log(`Buscando pedidos por updated_at con filtro: ${queryFilters}`);
 
     while (hasNextPage) {
+      // Las transacciones dan la FECHA DE PAGO real (la que muestra Shopify como "Paid at"),
+      // que no siempre coincide con processedAt: un pedido puede crearse un dia y pagarse otro.
+      // Si la tienda no expone este campo, se reintenta sin el y se usa processedAt.
+      const bloqueTransacciones = incluirTransacciones
+        ? `
+                transactions(first: 20) {
+                  id
+                  kind
+                  status
+                  processedAt
+                }`
+        : '';
+
       const graphqlQuery = `
         query getOrders($first: Int!, $after: String, $queryStr: String!) {
           orders(first: $first, after: $after, query: $queryStr) {
@@ -291,7 +305,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
                 processedAt
                 cancelledAt
                 displayFinancialStatus
-                returnStatus
+                returnStatus${bloqueTransacciones}
                 displayFulfillmentStatus
                 retailLocation {
                   name
@@ -434,7 +448,15 @@ app.post('/api/fetch-settlements', async (req, res) => {
       );
 
       if (response.data.errors) {
-        throw new Error(response.data.errors.map((e) => e.message).join(', '));
+        const mensaje = response.data.errors.map((e) => e.message).join(', ');
+        // Si la version de la API no acepta el bloque de transacciones, se reintenta la misma
+        // pagina sin el en vez de romper toda la liquidacion.
+        if (incluirTransacciones && /transaction/i.test(mensaje)) {
+          incluirTransacciones = false;
+          avisoTransacciones = `No se pudieron leer las transacciones (${mensaje}). Se usa la fecha de procesamiento del pedido como fecha de pago.`;
+          continue;
+        }
+        throw new Error(mensaje);
       }
 
       const ordersData = response.data?.data?.orders;
@@ -450,27 +472,38 @@ app.post('/api/fetch-settlements', async (req, res) => {
 
     const vendorAggregates = {};
     const missingCosts = [];
-    // Red de seguridad: artículos despachados dentro del período que no se pudieron liquidar.
-    // Si esto vuelve con algo, hay ventas quedando afuera y hay que mirarlas a mano.
-    const skippedFulfillmentLines = [];
     // Devoluciones que todavía no se descuentan porque el cambio no se cerró.
     const devolucionesEnCurso = [];
-    // Pedidos con despachos en el período que no generaron ninguna venta.
-    const pedidosSinLiquidar = [];
-    // Artículos rescatados cuyo despacho no traía los datos del artículo.
-    const lineasRecuperadas = [];
-    // Control final: artículos que Shopify da por despachados y no quedaron liquidados.
-    const articulosNoLiquidados = [];
     // Devoluciones que se descuentan aunque Shopify no haya repuesto el articulo al stock.
     const devolucionesSinReposicion = [];
     // Traza completa de los pedidos vigilados: todo lo que la app ve de ellos.
     const pedidosVigilados = [];
     // Notas de credito que no se descuentan porque su reemplazo tampoco se liquida.
     const notasDeCreditoOmitidas = [];
-    // Articulos despachados en el periodo que pertenecen a pedidos anteriores al corte: no se
-    // liquidan (ya se pagaron en su mes) pero se informan para poder revisarlos a mano.
-    const articulosDePedidosAnterioresAlCorte = [];
-    const corteCriterio = new Date(`${CORTE_CRITERIO_DESPACHO}T00:00:00${TZ_OFFSET}`).getTime();
+    // Articulos que se liquidan pero todavia no salieron del deposito. Se pagan igual (criterio
+    // de fecha de pago), pero conviene tenerlos a la vista.
+    const articulosSinDespachar = [];
+    // Pedidos creados ANTES del periodo pero pagados dentro. Con el criterio viejo (fecha del
+    // pedido) pueden haberse liquidado el mes pasado: hay que mirarlos para no pagar dos veces.
+    const pedidosCreadosAntesPeroPagadosEnElPeriodo = [];
+
+    // ============================================================================
+    // FECHA DE PAGO: es el criterio de liquidacion. Se toma el primer cobro exitoso del
+    // pedido (lo que Shopify muestra como "Paid at"); si no hay transacciones disponibles,
+    // se cae a processedAt. Se usa el PRIMER cobro y no el ultimo para que un pedido pagado
+    // en cuotas no se liquide dos veces en meses distintos.
+    // ============================================================================
+    const fechaDePago = (order) => {
+      const cobros = (order.transactions || [])
+        .filter((t) => ['SALE', 'CAPTURE'].includes(String(t.kind || '').toUpperCase()))
+        .filter((t) => String(t.status || '').toUpperCase() === 'SUCCESS')
+        .map((t) => new Date(t.processedAt).getTime())
+        .filter((t) => !isNaN(t))
+        .sort((a, b) => a - b);
+      if (cobros.length) return cobros[0];
+      const p = new Date(order.processedAt).getTime();
+      return isNaN(p) ? null : p;
+    };
 
     const registerItemRecord = (brand, item, quantity, date, orderName, type, hasCostInShopify, unitCostShopify, salePrice, paymentStatus, location) => {
       
@@ -685,24 +718,95 @@ app.post('/api/fetch-settlements', async (req, res) => {
       });
 
       // ============================================================================
-      // VENTAS: se liquidan por FECHA DE DESPACHO, no por fecha del pedido.
-      // Un artículo de un pedido de julio despachado el 4/8 corresponde a agosto, y un
-      // artículo pagado pero todavía no despachado no se liquida hasta que sale.
+      // VENTAS: se liquidan por FECHA DE PAGO del pedido.
+      // Si el cliente pago dentro del periodo, el proveedor cobra todo lo que quedo en el
+      // pedido, este despachado o no. No hay corte ni fechas de despacho: cada pedido se
+      // paga una sola vez, en el mes en que entro la plata.
       // ============================================================================
 
-      const pedidoAnteriorAlCorte = new Date(order.processedAt).getTime() < corteCriterio;
+      const pagoTs = fechaDePago(order);
+      const pagadoEnElPeriodo = pagoTs !== null && pagoTs >= startDateTime && pagoTs <= endDateTime;
+      const pagadoAntesDelPeriodo = pagoTs !== null && pagoTs < startDateTime;
 
-      // ¿Salió alguna prenda de este pedido dentro del período? En un pedido anterior al corte
-      // eso significa que hubo un reemplazo (cambio o reposición por falla) que NO se liquida
-      // porque la venta original ya se pagó en su mes.
-      // OJO: no alcanza con mirar si el pedido despachó "algo". Un pedido puede tener prendas
-      // de varias marcas: si en agosto salió un reemplazo de la marca A, eso no dice nada sobre
-      // una devolución de la marca B del mismo pedido, y suprimir esa nota de crédito le hace
-      // pagar de más al proveedor B. (Caso #206107: la nota de FAMILYARG se estaba comiendo
-      // porque el pedido despachó un artículo de otra marca.) Por eso se guarda POR MARCA qué
-      // se despachó dentro del período.
-      const marcasConDespachoEnElPeriodo = new Set();
-      {
+      const extractCost = (item) => {
+        if (item.variant?.inventoryItem?.unitCost?.amount) {
+          return { unitCost: parseFloat(item.variant.inventoryItem.unitCost.amount), hasCostInShopify: true };
+        }
+        return { unitCost: 0, hasCostInShopify: false };
+      };
+
+      if (pagadoEnElPeriodo) {
+        // Aviso: pedido de un mes anterior cobrado recien ahora. Con el criterio viejo (fecha
+        // del pedido) pudo haberse liquidado antes, asi que se informa para revisarlo.
+        const creadoTs = new Date(order.createdAt).getTime();
+        if (!isNaN(creadoTs) && creadoTs < startDateTime) {
+          pedidosCreadosAntesPeroPagadosEnElPeriodo.push({
+            orderName: order.name,
+            creado: order.createdAt,
+            pagado: new Date(pagoTs).toISOString(),
+          });
+        }
+
+        // Ubicacion informativa: la del despacho si el articulo ya salio; si no, la del pedido.
+        const ubicacionPorItem = {};
+        (order.fulfillments || []).forEach((f) => {
+          const estado = (f.status || '').toUpperCase();
+          if (['CANCELLED', 'CANCELED', 'ERROR', 'FAILURE'].includes(estado)) return;
+          (f.fulfillmentLineItems?.edges || []).forEach((fEdge) => {
+            const id = fEdge.node.lineItem?.id;
+            if (id && !ubicacionPorItem[id]) ubicacionPorItem[id] = f.location?.name || null;
+          });
+        });
+
+        lineItemsList.forEach((edge) => {
+          const item = edge.node;
+
+          // currentQuantity refleja lo que quedo en el pedido: un articulo eliminado en una
+          // edicion queda en 0 y no se liquida.
+          const cantidad = item.currentQuantity ?? item.quantity ?? 0;
+          if (cantidad <= 0) return;
+          if (!item.title && !item.sku) return;
+
+          const brand = normalizeBrand(item.vendor, item.title);
+          const salePrice = parseFloat(item.originalUnitPriceSet?.shopMoney?.amount || 0);
+          const { unitCost, hasCostInShopify } = extractCost(item);
+          const despachadoDesde = ubicacionPorItem[item.id];
+          const ubicacion = despachadoDesde || orderLoc || 'Sin Despachar';
+
+          if (!despachadoDesde && !orderLoc) {
+            articulosSinDespachar.push({
+              orderName: order.name,
+              sku: item.sku || 'SIN_SKU',
+              title: item.title,
+              variantTitle: item.variantTitle || '',
+              quantity: cantidad,
+              marca: brand,
+              pagado: new Date(pagoTs).toISOString(),
+            });
+          }
+
+          registerItemRecord(
+            brand,
+            item,
+            cantidad,
+            new Date(pagoTs).toISOString(),
+            order.name,
+            'Venta',
+            hasCostInShopify,
+            unitCost,
+            salePrice,
+            order.displayFinancialStatus,
+            ubicacion
+          );
+        });
+      }
+
+      // Para un pedido PAGADO EN UN MES ANTERIOR, un despacho dentro de este periodo significa
+      // que salio un articulo de cambio: ese reemplazo no se liquida (la venta ya se cobro en su
+      // mes) y por lo tanto la nota de credito de lo devuelto tampoco corresponde. Se guarda por
+      // MARCA para no tapar la nota de un proveedor con el reemplazo de otro (caso #206107).
+      const marcasConReemplazoEnElPeriodo = new Set();
+      if (pagadoAntesDelPeriodo) {
         const porId = {};
         lineItemsList.forEach((edge) => { porId[edge.node.id] = edge.node; });
         (order.fulfillments || []).forEach((f) => {
@@ -713,226 +817,9 @@ app.post('/api/fetch-settlements', async (req, res) => {
             const ref = fEdge.node.lineItem;
             const resuelto = porId[ref?.id] || ref;
             if (!resuelto || !(resuelto.title || resuelto.sku)) return;
-            marcasConDespachoEnElPeriodo.add(normalizeBrand(resuelto.vendor, resuelto.title));
+            marcasConReemplazoEnElPeriodo.add(normalizeBrand(resuelto.vendor, resuelto.title));
           });
         });
-      }
-
-      const extractCost = (item) => {
-        if (item.variant?.inventoryItem?.unitCost?.amount) {
-          return { unitCost: parseFloat(item.variant.inventoryItem.unitCost.amount), hasCostInShopify: true };
-        }
-        return { unitCost: 0, hasCostInShopify: false };
-      };
-
-      {
-        // Los despachos se recorren SIEMPRE, tenga el pedido sucursal asignada o no. Antes,
-        // si el pedido tenía sucursal (venta de local o pedido preliminar asignado a un
-        // depósito) se ignoraban sus despachos y se caían artículos ya enviados.
-        const lineItemById = {};
-        lineItemsList.forEach((edge) => {
-          lineItemById[edge.node.id] = edge.node;
-        });
-
-        // Diagnóstico: qué despachos del período vio la app en este pedido y qué hizo con ellos.
-        const despachosEnPeriodo = [];
-        const registradoPorItem = {};
-        const contar = (id, q) => { if (id) registradoPorItem[id] = (registradoPorItem[id] || 0) + q; };
-        const todosLosDespachos = (order.fulfillments || []).map((f) => ({
-          id: f.id, fecha: f.createdAt, estado: f.status || '(sin estado)', sucursal: f.location?.name || null,
-          enElPeriodo: (() => { const t = new Date(f.createdAt).getTime(); return !isNaN(t) && t >= startDateTime && t <= endDateTime; })(),
-          lineas: (f.fulfillmentLineItems?.edges || []).map((e) => ({
-            lineItemId: e.node.lineItem?.id || null, titulo: e.node.lineItem?.title || null,
-            sku: e.node.lineItem?.sku || null, cantidad: e.node.quantity,
-          })),
-        }));
-        const registrosAntes = Object.values(vendorAggregates).reduce((n, v) => n + v.items.length, 0);
-
-        // Artículos que salen por algún despacho, en cualquier fecha. Los de esta lista no
-        // se vuelven a tomar por la rama de local, para no contarlos dos veces.
-        const itemsConDespacho = new Set();
-        // OJO: solo cuentan los despachos de los que efectivamente se pueden leer los datos
-        // del artículo. Si el despacho trae la referencia pero vacía —lo que pasa cuando el
-        // pedido se editó después de enviarse— NO se marca como cubierto, porque si no el
-        // rescate de más abajo nunca se activaría justo en el caso para el que existe.
-        (order.fulfillments || []).forEach((f) => {
-          (f.fulfillmentLineItems?.edges || []).forEach((fEdge) => {
-            const ref = fEdge.node.lineItem;
-            if (!ref?.id) return;
-            const resuelto = lineItemById[ref.id] || ref;
-            if (resuelto && (resuelto.title || resuelto.sku)) itemsConDespacho.add(ref.id);
-          });
-        });
-
-        (order.fulfillments || []).forEach((f) => {
-          const fulfillmentTime = new Date(f.createdAt).getTime();
-          if (isNaN(fulfillmentTime) || fulfillmentTime < startDateTime || fulfillmentTime > endDateTime) {
-            return;
-          }
-
-          // Los despachos cancelados siguen viniendo en la respuesta de Shopify. Si no se
-          // descartan, un pedido al que se le anuló un despacho y se le hizo otro (queda como
-          // F1 cancelado + F2 activo) se liquida DOS VECES.
-          const fulfillmentStatus = (f.status || '').toUpperCase();
-          if (['CANCELLED', 'CANCELED', 'ERROR', 'FAILURE'].includes(fulfillmentStatus)) {
-            return;
-          }
-
-          const fulfillmentLoc = f.location?.name || 'Sin Ubicación';
-          const fItems = f.fulfillmentLineItems?.edges || [];
-
-          despachosEnPeriodo.push({
-            fulfillmentId: f.id,
-            fecha: f.createdAt,
-            estado: f.status || '(sin estado)',
-            sucursal: fulfillmentLoc,
-            lineas: fItems.map((e) => ({
-              lineItemId: e.node.lineItem?.id || null,
-              estaEnElPedido: !!lineItemById[e.node.lineItem?.id],
-              titulo: e.node.lineItem?.title || null,
-              vendor: e.node.lineItem?.vendor || null,
-              cantidad: e.node.quantity,
-            })),
-          });
-
-          fItems.forEach((fEdge) => {
-            const fLine = fEdge.node;
-
-            // Pedido anterior al corte: ya se liquidó en su mes con el criterio viejo.
-            if (pedidoAnteriorAlCorte) {
-              const previo = lineItemById[fLine.lineItem?.id] || fLine.lineItem;
-              if (previo && (previo.title || previo.sku)) {
-                articulosDePedidosAnterioresAlCorte.push({
-                  orderName: order.name,
-                  sku: previo.sku || 'SIN_SKU',
-                  title: previo.title,
-                  variantTitle: previo.variantTitle || '',
-                  quantity: fLine.quantity,
-                  despachado: f.createdAt,
-                  pedidoDel: order.processedAt,
-                });
-              }
-              return;
-            }
-
-            // Se busca el artículo en order.lineItems y, si no aparece ahí (pedidos editados,
-            // importados o con artículos agregados a mano), se usa el que trae el propio
-            // despacho. Antes, cuando no aparecía, la línea se perdía en silencio.
-            const item = lineItemById[fLine.lineItem?.id] || fLine.lineItem;
-            if (!item || (!item.title && !item.sku)) {
-              skippedFulfillmentLines.push({ orderName: order.name, fulfillmentId: f.id, reason: 'Sin datos del artículo' });
-              return;
-            }
-
-            // Cantidad efectivamente despachada: un artículo puede salir en despachos parciales
-            const quantity = fLine.quantity;
-            if (!quantity) return;
-
-            const brand = normalizeBrand(item.vendor, item.title);
-            const salePrice = parseFloat(item.originalUnitPriceSet?.shopMoney?.amount || 0);
-            const { unitCost, hasCostInShopify } = extractCost(item);
-
-            contar(fLine.lineItem?.id, quantity);
-            registerItemRecord(brand, item, quantity, f.createdAt, order.name, 'Venta', hasCostInShopify, unitCost, salePrice, order.displayFinancialStatus, fulfillmentLoc);
-          });
-        });
-
-        // RESCATE: cuando se edita un pedido ya despachado (por ejemplo para agregarle un
-        // remito), Shopify puede dejar de devolver los datos del artículo dentro del despacho.
-        // Ese artículo figura como enviado en el pedido pero no aparece en ningún despacho que
-        // podamos leer, y se perdía. Acá se recupera usando la fecha del despacho del período.
-        if (despachosEnPeriodo.length > 0 && !pedidoAnteriorAlCorte) {
-          const primerDespacho = despachosEnPeriodo[0];
-          lineItemsList.forEach((edge) => {
-            const item = edge.node;
-            if (itemsConDespacho.has(item.id)) return;
-
-            // Un articulo ELIMINADO del pedido (lo que Shopify muestra como "Eliminado" cuando
-            // se edito la orden) queda con currentQuantity en 0 y, como no esta pendiente de
-            // envio, su unfulfilledQuantity tambien es 0. Sin este tope, el rescate lo tomaba
-            // como despachado y liquidaba una prenda que en realidad nunca salio.
-            const activo = item.currentQuantity ?? item.quantity ?? 0;
-            const cantidadDespachada = Math.min(
-              (item.quantity || 0) - (item.unfulfilledQuantity ?? item.quantity ?? 0),
-              activo
-            );
-            if (cantidadDespachada <= 0) return;
-
-            const brand = normalizeBrand(item.vendor, item.title);
-            const salePrice = parseFloat(item.originalUnitPriceSet?.shopMoney?.amount || 0);
-            const { unitCost, hasCostInShopify } = extractCost(item);
-
-            itemsConDespacho.add(item.id);
-            lineasRecuperadas.push({
-              orderName: order.name,
-              sku: item.sku || 'SIN_SKU',
-              title: item.title,
-              variantTitle: item.variantTitle || '',
-              quantity: cantidadDespachada,
-              fecha: primerDespacho.fecha,
-              motivo: 'El despacho no traía los datos del artículo (pedido editado despues de enviarse)',
-            });
-
-            contar(item.id, cantidadDespachada);
-            registerItemRecord(brand, item, cantidadDespachada, primerDespacho.fecha, order.name, 'Venta', hasCostInShopify, unitCost, salePrice, order.displayFinancialStatus, primerDespacho.sucursal);
-          });
-        }
-
-        // Venta de local (POS): los artículos que se entregan en el momento no generan
-        // despacho, así que esos —y solo esos— se toman por la fecha del pedido.
-        if (orderLoc) {
-          const orderProcessedTime = new Date(order.processedAt).getTime();
-          if (orderProcessedTime >= startDateTime && orderProcessedTime <= endDateTime) {
-            lineItemsList.forEach((edge) => {
-              const item = edge.node;
-
-              // Ya contado más arriba por su despacho
-              if (itemsConDespacho.has(item.id)) return;
-
-              // Omitir artículos que fueron eliminados de la orden (currentQuantity = 0)
-              if (itemCurrentQuantityMap[item.id] === 0) return;
-
-              const brand = normalizeBrand(item.vendor, item.title);
-              const salePrice = parseFloat(item.originalUnitPriceSet?.shopMoney?.amount || 0);
-              const { unitCost, hasCostInShopify } = extractCost(item);
-
-              contar(item.id, item.quantity);
-              registerItemRecord(brand, item, item.quantity, order.processedAt, order.name, 'Venta', hasCostInShopify, unitCost, salePrice, order.displayFinancialStatus, orderLoc);
-            });
-          }
-        }
-
-        // Si el pedido tuvo despachos dentro del período pero no generó ninguna venta,
-        // algo se está perdiendo. Se guarda el detalle para poder verlo.
-        const registrosDespues = Object.values(vendorAggregates).reduce((n, v) => n + v.items.length, 0);
-        if (despachosEnPeriodo.length > 0 && registrosDespues === registrosAntes) {
-          pedidosSinLiquidar.push({ orderName: order.name, despachos: despachosEnPeriodo });
-        }
-
-        // Control fino: artículo por artículo, lo que Shopify dice que se despachó contra lo
-        // que efectivamente se liquidó. Si falta algo, queda registrado con todo el detalle.
-        if (despachosEnPeriodo.length > 0) {
-          lineItemsList.forEach((edge) => {
-            const item = edge.node;
-            // Si el articulo aparece en algun despacho (aunque sea de otro mes), su lugar ya
-            // esta definido y no corresponde marcarlo como faltante de este periodo.
-            if (itemsConDespacho.has(item.id)) return;
-            const despachado = (item.quantity || 0) - (item.unfulfilledQuantity ?? item.quantity ?? 0);
-            const liquidado = registradoPorItem[item.id] || 0;
-            if (despachado > liquidado) {
-              articulosNoLiquidados.push({
-                orderName: order.name,
-                sku: item.sku || 'SIN_SKU',
-                title: item.title,
-                variantTitle: item.variantTitle || '',
-                lineItemId: item.id,
-                despachado,
-                liquidado,
-                despachosDelPedido: todosLosDespachos,
-              });
-            }
-          });
-        }
       }
 
       const refunds = order.refunds || [];
@@ -960,17 +847,17 @@ app.post('/api/fetch-settlements', async (req, res) => {
             // nunca se le devuelve la plata al cliente antes de recibir la prenda, así que un
             // reembolso hecho significa que la mercadería volvió, se haya repuesto al inventario
             // o no (por ejemplo si volvió fallada).
-            // Pedido anterior al corte que ademas despacho un reemplazo en el periodo: la venta
-            // original ya se pago en su mes y el reemplazo no se vuelve a cobrar, asi que la nota
-            // de credito tampoco corresponde. Van las dos juntas o ninguna. (Caso #205479: buzo
-            // devuelto por falla y repuesto por otro igual.) Si el pedido viejo NO despacho nada
+            // Pedido pagado en un mes anterior que ademas saco un reemplazo en este periodo: la
+            // venta original ya se cobro en su mes y el reemplazo no se vuelve a cobrar, asi que
+            // la nota de credito tampoco corresponde. Van las dos juntas o ninguna. (Caso #205479:
+            // buzo devuelto por falla y repuesto por otro igual.) Si el pedido viejo NO saco nada
             // en el periodo, fue una devolucion sin reemplazo y la nota SI se descuenta.
             //
             // El reemplazo tiene que ser DE LA MISMA MARCA que lo devuelto. Si el pedido viejo
             // despachó en el período algo de otra marca, para este proveedor fue una devolución
             // sin reemplazo y la nota SÍ se descuenta.
             const marcaDevuelta = normalizeBrand(item.vendor, item.title);
-            if (pedidoAnteriorAlCorte && marcasConDespachoEnElPeriodo.has(marcaDevuelta)) {
+            if (pagadoAntesDelPeriodo && marcasConReemplazoEnElPeriodo.has(marcaDevuelta)) {
               notasDeCreditoOmitidas.push({
                 orderName: order.name,
                 sku: item.sku || 'SIN_SKU',
@@ -978,7 +865,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
                 variantTitle: item.variantTitle || '',
                 marca: marcaDevuelta,
                 quantity: refundItem.quantity,
-                motivo: 'Pedido anterior al corte con reemplazo de la misma marca despachado: el reemplazo no se liquida, la nota tampoco',
+                motivo: 'Pedido pagado en un mes anterior con reemplazo de la misma marca: el reemplazo no se liquida, la nota tampoco',
               });
               return;
             }
@@ -1055,29 +942,24 @@ app.post('/api/fetch-settlements', async (req, res) => {
     ultimoDiagnostico = {
       generado: new Date().toISOString(),
       periodo: `${startDate} a ${endDate}`,
+      criterio: 'FECHA DE PAGO',
+      avisoTransacciones,
       pedidosTraidos: allOrders.length,
-      lineasRecuperadas,
-      articulosNoLiquidados,
-      articulosDePedidosAnterioresAlCorte,
+      articulosSinDespachar,
+      pedidosCreadosAntesPeroPagadosEnElPeriodo,
       notasDeCreditoOmitidas,
       devolucionesSinReposicion,
       pedidosVigilados,
-      skippedFulfillmentLines,
-      pedidosSinLiquidar,
       devolucionesEnCurso,
     };
 
-    if (skippedFulfillmentLines.length) {
-      console.log('=== ARTICULOS DESPACHADOS QUE NO SE PUDIERON LIQUIDAR ===');
-      console.log(JSON.stringify(skippedFulfillmentLines, null, 2));
+    if (avisoTransacciones) {
+      console.log('=== AVISO ===');
+      console.log(avisoTransacciones);
     }
-    if (pedidosSinLiquidar.length) {
-      console.log('=== PEDIDOS CON DESPACHOS EN EL PERIODO QUE NO GENERARON NINGUNA VENTA ===');
-      console.log(JSON.stringify(pedidosSinLiquidar, null, 2));
-    }
-    if (lineasRecuperadas.length) {
-      console.log('=== ARTICULOS RECUPERADOS (el despacho no traia sus datos) ===');
-      console.log(lineasRecuperadas.map((l) => `${l.orderName} ${l.sku} x${l.quantity} - ${l.fecha}`).join('\n'));
+    if (articulosSinDespachar.length) {
+      console.log('=== ARTICULOS LIQUIDADOS QUE TODAVIA NO SE DESPACHARON ===');
+      console.log(articulosSinDespachar.map((a) => `${a.orderName} ${a.sku} x${a.quantity} (${a.marca})`).join('\n'));
     }
     if (devolucionesEnCurso.length) {
       console.log('=== DEVOLUCIONES EN CURSO (no se descontaron) ===');
@@ -1090,15 +972,14 @@ app.post('/api/fetch-settlements', async (req, res) => {
       summary,
       details: vendorAggregates,
       missingCosts,
-      skippedFulfillmentLines,
+      criterio: 'FECHA DE PAGO',
+      avisoTransacciones,
       devolucionesEnCurso,
       devolucionesSinReposicion,
-      articulosDePedidosAnterioresAlCorte,
       notasDeCreditoOmitidas,
       pedidosVigilados,
-      pedidosSinLiquidar,
-      lineasRecuperadas,
-      articulosNoLiquidados,
+      articulosSinDespachar,
+      pedidosCreadosAntesPeroPagadosEnElPeriodo,
     });
   } catch (error) {
     console.error('Error al procesar liquidaciones:', error.message);
