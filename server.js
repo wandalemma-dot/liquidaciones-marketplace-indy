@@ -223,20 +223,6 @@ app.post('/api/verify-connection', async (req, res) => {
   }
 });
 
-// Version del codigo en ejecucion y ultimo diagnostico, para poder verificar que el servidor
-// desplegado sea el que corresponde sin tener que entrar a los logs del hosting.
-const VERSION_APP = '2026-09-03-a';
-// CRITERIO DE LIQUIDACION VIGENTE: FECHA DE PAGO del pedido. Si el cliente pago dentro del
-// periodo, el proveedor cobra todo lo que quedo en el pedido, este despachado o no. No hay
-// fecha de corte: cada pedido se paga una sola vez, en el mes en que entro la plata.
-// Pedidos a trazar en detalle en el diagnostico, para investigar casos puntuales.
-const PEDIDOS_A_VIGILAR = (process.env.PEDIDOS_A_VIGILAR || '#207050').split(',').map((x) => x.trim()).filter(Boolean);
-let ultimoDiagnostico = { generado: null, resumen: 'Todavia no se genero ninguna liquidacion en este servidor.' };
-
-app.get('/api/version', (req, res) => {
-  res.json({ version: VERSION_APP, diagnostico: ultimoDiagnostico });
-});
-
 // 4. Endpoint para obtener pedidos y calcular pre-liquidaciones (Soporta Devoluciones y Descuentos)
 app.post('/api/fetch-settlements', async (req, res) => {
   const { storeUrl, accessToken, startDate, endDate, financialStatus, fulfillmentStatus, brandDiscounts = {} } = req.body;
@@ -247,19 +233,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
   }
 
   try {
-    // El corte del mes se hace en hora de Argentina, no en UTC: sin esto, una venta del 31/8
-    // a las 22:00 (01:00 UTC del 1/9) se escapaba del período.
-    const TZ_OFFSET = '-03:00';
-
-    // Los límites se mandan a Shopify en UTC puro (terminados en Z). Antes se mandaban con el
-    // desfasaje "-03:00" adentro de la búsqueda y el buscador de Shopify no lo interpretaba
-    // bien: se quedaban afuera pedidos que sí correspondían al mes (por ejemplo el #207050).
-    const inicioUTC = new Date(`${startDate}T00:00:00${TZ_OFFSET}`).toISOString();
-
-    // Un solo criterio, sin paréntesis ni OR: todo pedido que tenga algo que ver con el mes
-    // (creado, despachado, devuelto o editado) quedó actualizado a partir del inicio del período.
-    // El recorte fino por fecha de despacho se hace más abajo, en código.
-    let queryFilters = `updated_at:>=${inicioUTC}`;
+    let queryFilters = `(created_at:>=${startDate}T00:00:00Z AND created_at:<=${endDate}T23:59:59Z) OR (updated_at:>=${startDate}T00:00:00Z AND updated_at:<=${endDate}T23:59:59Z)`;
 
     if (financialStatus && financialStatus !== 'any') {
       queryFilters += ` AND financial_status:${financialStatus}`;
@@ -271,25 +245,10 @@ app.post('/api/fetch-settlements', async (req, res) => {
     let hasNextPage = true;
     let cursor = null;
     let allOrders = [];
-    let incluirTransacciones = true;
-    let avisoTransacciones = null;
 
     console.log(`Buscando pedidos por updated_at con filtro: ${queryFilters}`);
 
     while (hasNextPage) {
-      // Las transacciones dan la FECHA DE PAGO real (la que muestra Shopify como "Paid at"),
-      // que no siempre coincide con processedAt: un pedido puede crearse un dia y pagarse otro.
-      // Si la tienda no expone este campo, se reintenta sin el y se usa processedAt.
-      const bloqueTransacciones = incluirTransacciones
-        ? `
-                transactions(first: 20) {
-                  id
-                  kind
-                  status
-                  processedAt
-                }`
-        : '';
-
       const graphqlQuery = `
         query getOrders($first: Int!, $after: String, $queryStr: String!) {
           orders(first: $first, after: $after, query: $queryStr) {
@@ -305,15 +264,12 @@ app.post('/api/fetch-settlements', async (req, res) => {
                 processedAt
                 cancelledAt
                 displayFinancialStatus
-                returnStatus${bloqueTransacciones}
                 displayFulfillmentStatus
                 retailLocation {
                   name
                 }
-                fulfillments(first: 50) {
+                fulfillments(first: 10) {
                   id
-                  createdAt
-                  status
                   location {
                     name
                   }
@@ -322,26 +278,6 @@ app.post('/api/fetch-settlements', async (req, res) => {
                       node {
                         lineItem {
                           id
-                          title
-                          vendor
-                          variantTitle
-                          sku
-                          originalUnitPriceSet {
-                            shopMoney {
-                              amount
-                            }
-                          }
-                          variant {
-                            id
-                            sku
-                            price
-                            inventoryItem {
-                              id
-                              unitCost {
-                                amount
-                              }
-                            }
-                          }
                         }
                         quantity
                       }
@@ -361,7 +297,6 @@ app.post('/api/fetch-settlements', async (req, res) => {
                       title
                       quantity
                       currentQuantity
-                      unfulfilledQuantity
                       vendor
                       variantTitle
                       sku
@@ -448,15 +383,7 @@ app.post('/api/fetch-settlements', async (req, res) => {
       );
 
       if (response.data.errors) {
-        const mensaje = response.data.errors.map((e) => e.message).join(', ');
-        // Si la version de la API no acepta el bloque de transacciones, se reintenta la misma
-        // pagina sin el en vez de romper toda la liquidacion.
-        if (incluirTransacciones && /transaction/i.test(mensaje)) {
-          incluirTransacciones = false;
-          avisoTransacciones = `No se pudieron leer las transacciones (${mensaje}). Se usa la fecha de procesamiento del pedido como fecha de pago.`;
-          continue;
-        }
-        throw new Error(mensaje);
+        throw new Error(response.data.errors.map((e) => e.message).join(', '));
       }
 
       const ordersData = response.data?.data?.orders;
@@ -467,43 +394,11 @@ app.post('/api/fetch-settlements', async (req, res) => {
       cursor = ordersData?.pageInfo?.endCursor || null;
     }
 
-    const startDateTime = new Date(`${startDate}T00:00:00${TZ_OFFSET}`).getTime();
-    const endDateTime = new Date(`${endDate}T23:59:59${TZ_OFFSET}`).getTime();
+    const startDateTime = new Date(`${startDate}T00:00:00Z`).getTime();
+    const endDateTime = new Date(`${endDate}T23:59:59Z`).getTime();
 
     const vendorAggregates = {};
     const missingCosts = [];
-    // Devoluciones que todavía no se descuentan porque el cambio no se cerró.
-    const devolucionesEnCurso = [];
-    // Devoluciones que se descuentan aunque Shopify no haya repuesto el articulo al stock.
-    const devolucionesSinReposicion = [];
-    // Traza completa de los pedidos vigilados: todo lo que la app ve de ellos.
-    const pedidosVigilados = [];
-    // Notas de credito que no se descuentan porque su reemplazo tampoco se liquida.
-    const notasDeCreditoOmitidas = [];
-    // Articulos que se liquidan pero todavia no salieron del deposito. Se pagan igual (criterio
-    // de fecha de pago), pero conviene tenerlos a la vista.
-    const articulosSinDespachar = [];
-    // Pedidos creados ANTES del periodo pero pagados dentro. Con el criterio viejo (fecha del
-    // pedido) pueden haberse liquidado el mes pasado: hay que mirarlos para no pagar dos veces.
-    const pedidosCreadosAntesPeroPagadosEnElPeriodo = [];
-
-    // ============================================================================
-    // FECHA DE PAGO: es el criterio de liquidacion. Se toma el primer cobro exitoso del
-    // pedido (lo que Shopify muestra como "Paid at"); si no hay transacciones disponibles,
-    // se cae a processedAt. Se usa el PRIMER cobro y no el ultimo para que un pedido pagado
-    // en cuotas no se liquide dos veces en meses distintos.
-    // ============================================================================
-    const fechaDePago = (order) => {
-      const cobros = (order.transactions || [])
-        .filter((t) => ['SALE', 'CAPTURE'].includes(String(t.kind || '').toUpperCase()))
-        .filter((t) => String(t.status || '').toUpperCase() === 'SUCCESS')
-        .map((t) => new Date(t.processedAt).getTime())
-        .filter((t) => !isNaN(t))
-        .sort((a, b) => a - b);
-      if (cobros.length) return cobros[0];
-      const p = new Date(order.processedAt).getTime();
-      return isNaN(p) ? null : p;
-    };
 
     const registerItemRecord = (brand, item, quantity, date, orderName, type, hasCostInShopify, unitCostShopify, salePrice, paymentStatus, location) => {
       
@@ -637,36 +532,6 @@ app.post('/api/fetch-settlements', async (req, res) => {
     };
 
     allOrders.forEach((order) => {
-      if (PEDIDOS_A_VIGILAR.includes(order.name)) {
-        pedidosVigilados.push({
-          orderName: order.name,
-          creado: order.createdAt,
-          procesado: order.processedAt,
-          cancelado: order.cancelledAt,
-          estadoPago: order.displayFinancialStatus,
-          estadoPreparacion: order.displayFulfillmentStatus,
-          estadoDevolucion: order.returnStatus,
-          sucursalDelPedido: order.retailLocation?.name || null,
-          articulos: (order.lineItems?.edges || []).map((e) => ({
-            id: e.node.id, sku: e.node.sku, titulo: e.node.title, vendor: e.node.vendor,
-            cantidad: e.node.quantity, actual: e.node.currentQuantity, sinDespachar: e.node.unfulfilledQuantity,
-          })),
-          despachos: (order.fulfillments || []).map((f) => ({
-            id: f.id, fecha: f.createdAt, estado: f.status, sucursal: f.location?.name || null,
-            lineas: (f.fulfillmentLineItems?.edges || []).map((e) => ({
-              lineItemId: e.node.lineItem?.id || null, sku: e.node.lineItem?.sku || null,
-              titulo: e.node.lineItem?.title || null, cantidad: e.node.quantity,
-            })),
-          })),
-          reembolsos: (order.refunds || []).map((r) => ({
-            id: r.id, fecha: r.createdAt,
-            lineas: (r.refundLineItems?.edges || []).map((e) => ({
-              sku: e.node.lineItem?.sku || null, cantidad: e.node.quantity, restockType: e.node.restockType,
-            })),
-          })),
-        });
-      }
-
       // Ignorar pedidos cancelados completamente para evitar deducciones incorrectas
       if (order.cancelledAt) {
         return;
@@ -717,116 +582,44 @@ app.post('/api/fetch-settlements', async (req, res) => {
         itemCurrentQuantityMap[item.id] = item.currentQuantity !== undefined ? item.currentQuantity : item.quantity;
       });
 
-      // ============================================================================
-      // VENTAS: se liquidan por FECHA DE PAGO del pedido.
-      // Si el cliente pago dentro del periodo, el proveedor cobra todo lo que quedo en el
-      // pedido, este despachado o no. No hay corte ni fechas de despacho: cada pedido se
-      // paga una sola vez, en el mes en que entro la plata.
-      // ============================================================================
-
-      const pagoTs = fechaDePago(order);
-      const pagadoEnElPeriodo = pagoTs !== null && pagoTs >= startDateTime && pagoTs <= endDateTime;
-      const pagadoAntesDelPeriodo = pagoTs !== null && pagoTs < startDateTime;
-
-      const extractCost = (item) => {
-        if (item.variant?.inventoryItem?.unitCost?.amount) {
-          return { unitCost: parseFloat(item.variant.inventoryItem.unitCost.amount), hasCostInShopify: true };
-        }
-        return { unitCost: 0, hasCostInShopify: false };
-      };
-
-      if (pagadoEnElPeriodo) {
-        // Aviso: pedido de un mes anterior cobrado recien ahora. Con el criterio viejo (fecha
-        // del pedido) pudo haberse liquidado antes, asi que se informa para revisarlo.
-        const creadoTs = new Date(order.createdAt).getTime();
-        if (!isNaN(creadoTs) && creadoTs < startDateTime) {
-          pedidosCreadosAntesPeroPagadosEnElPeriodo.push({
-            orderName: order.name,
-            creado: order.createdAt,
-            pagado: new Date(pagoTs).toISOString(),
-          });
-        }
-
-        // Ubicacion informativa: la del despacho si el articulo ya salio; si no, la del pedido.
-        const ubicacionPorItem = {};
-        (order.fulfillments || []).forEach((f) => {
-          const estado = (f.status || '').toUpperCase();
-          if (['CANCELLED', 'CANCELED', 'ERROR', 'FAILURE'].includes(estado)) return;
-          (f.fulfillmentLineItems?.edges || []).forEach((fEdge) => {
-            const id = fEdge.node.lineItem?.id;
-            if (id && !ubicacionPorItem[id]) ubicacionPorItem[id] = f.location?.name || null;
-          });
-        });
-
-        lineItemsList.forEach((edge) => {
+      const orderProcessedTime = new Date(order.processedAt).getTime();
+      if (orderProcessedTime >= startDateTime && orderProcessedTime <= endDateTime) {
+        const lineItems = order.lineItems?.edges || [];
+        lineItems.forEach((edge) => {
           const item = edge.node;
 
-          // currentQuantity refleja lo que quedo en el pedido: un articulo eliminado en una
-          // edicion queda en 0 y no se liquida.
-          const cantidad = item.currentQuantity ?? item.quantity ?? 0;
-          if (cantidad <= 0) return;
-          if (!item.title && !item.sku) return;
-
-          const brand = normalizeBrand(item.vendor, item.title);
-          const salePrice = parseFloat(item.originalUnitPriceSet?.shopMoney?.amount || 0);
-          const { unitCost, hasCostInShopify } = extractCost(item);
-          const despachadoDesde = ubicacionPorItem[item.id];
-          const ubicacion = despachadoDesde || orderLoc || 'Sin Despachar';
-
-          if (!despachadoDesde && !orderLoc) {
-            articulosSinDespachar.push({
-              orderName: order.name,
-              sku: item.sku || 'SIN_SKU',
-              title: item.title,
-              variantTitle: item.variantTitle || '',
-              quantity: cantidad,
-              marca: brand,
-              pagado: new Date(pagoTs).toISOString(),
-            });
+          // Omitir artículos unfulfilled (no preparados) y que fueron eliminados de la orden (currentQuantity = 0)
+          const isFulfilledOrPOS = !!fulfilledItemMap[item.id] || !!orderLoc;
+          const currentQty = itemCurrentQuantityMap[item.id];
+          if (!isFulfilledOrPOS && currentQty === 0) {
+            return;
           }
 
-          registerItemRecord(
-            brand,
-            item,
-            cantidad,
-            new Date(pagoTs).toISOString(),
-            order.name,
-            'Venta',
-            hasCostInShopify,
-            unitCost,
-            salePrice,
-            order.displayFinancialStatus,
-            ubicacion
-          );
-        });
-      }
+          const brand = normalizeBrand(item.vendor, item.title);
+          const quantity = item.quantity;
+          const salePrice = parseFloat(item.originalUnitPriceSet?.shopMoney?.amount || 0);
 
-      // Para un pedido PAGADO EN UN MES ANTERIOR, un despacho dentro de este periodo significa
-      // que salio un articulo de cambio: ese reemplazo no se liquida (la venta ya se cobro en su
-      // mes) y por lo tanto la nota de credito de lo devuelto tampoco corresponde. Se guarda por
-      // MARCA para no tapar la nota de un proveedor con el reemplazo de otro (caso #206107).
-      const marcasConReemplazoEnElPeriodo = new Set();
-      if (pagadoAntesDelPeriodo) {
-        const porId = {};
-        lineItemsList.forEach((edge) => { porId[edge.node.id] = edge.node; });
-        (order.fulfillments || []).forEach((f) => {
-          const t = new Date(f.createdAt).getTime();
-          if (isNaN(t) || t < startDateTime || t > endDateTime) return;
-          if (['CANCELLED', 'CANCELED', 'ERROR', 'FAILURE'].includes((f.status || '').toUpperCase())) return;
-          (f.fulfillmentLineItems?.edges || []).forEach((fEdge) => {
-            const ref = fEdge.node.lineItem;
-            const resuelto = porId[ref?.id] || ref;
-            if (!resuelto || !(resuelto.title || resuelto.sku)) return;
-            marcasConReemplazoEnElPeriodo.add(normalizeBrand(resuelto.vendor, resuelto.title));
-          });
+          let unitCost = 0;
+          let hasCostInShopify = false;
+          if (item.variant?.inventoryItem?.unitCost?.amount) {
+            unitCost = parseFloat(item.variant.inventoryItem.unitCost.amount);
+            hasCostInShopify = true;
+          }
+
+          // Determinar ubicación: buscar en mapa de despacho, sino usar la ubicación de POS, sino 'Sin Ubicación'
+          const itemLoc = itemLocationMap[item.id] || orderLoc || 'Sin Ubicación';
+
+          registerItemRecord(brand, item, quantity, order.processedAt, order.name, 'Venta', hasCostInShopify, unitCost, salePrice, order.displayFinancialStatus, itemLoc);
         });
       }
 
       const refunds = order.refunds || [];
+      let processedRefundsForOrder = false;
 
       refunds.forEach((refund) => {
         const refundTime = new Date(refund.createdAt).getTime();
         if (refundTime >= startDateTime && refundTime <= endDateTime) {
+          processedRefundsForOrder = true;
           const refundLineItems = refund.refundLineItems?.edges || [];
           
           refundLineItems.forEach((edge) => {
@@ -837,62 +630,6 @@ app.post('/api/fetch-settlements', async (req, res) => {
             // NO contar cancelaciones por edicion de orden (ej. cambio de talle antes de despachar):
             // no son devoluciones reales, el proveedor conserva la venta del articulo que si se despacho.
             if (refundItem.restockType === 'CANCEL') return;
-
-            // Una devolución se descuenta recién cuando el cambio se cerró. Mientras la
-            // devolución está EN CURSO —el cliente la pidió pero todavía no se resolvió— la
-            // venta se mantiene como venta normal y la nota de crédito espera al mes en que
-            // se cierre.
-            //
-            // Importante: NO se mira si Shopify repuso el artículo al stock. En esta operación
-            // nunca se le devuelve la plata al cliente antes de recibir la prenda, así que un
-            // reembolso hecho significa que la mercadería volvió, se haya repuesto al inventario
-            // o no (por ejemplo si volvió fallada).
-            // Pedido pagado en un mes anterior que ademas saco un reemplazo en este periodo: la
-            // venta original ya se cobro en su mes y el reemplazo no se vuelve a cobrar, asi que
-            // la nota de credito tampoco corresponde. Van las dos juntas o ninguna. (Caso #205479:
-            // buzo devuelto por falla y repuesto por otro igual.) Si el pedido viejo NO saco nada
-            // en el periodo, fue una devolucion sin reemplazo y la nota SI se descuenta.
-            //
-            // El reemplazo tiene que ser DE LA MISMA MARCA que lo devuelto. Si el pedido viejo
-            // despachó en el período algo de otra marca, para este proveedor fue una devolución
-            // sin reemplazo y la nota SÍ se descuenta.
-            const marcaDevuelta = normalizeBrand(item.vendor, item.title);
-            if (pagadoAntesDelPeriodo && marcasConReemplazoEnElPeriodo.has(marcaDevuelta)) {
-              notasDeCreditoOmitidas.push({
-                orderName: order.name,
-                sku: item.sku || 'SIN_SKU',
-                title: item.title,
-                variantTitle: item.variantTitle || '',
-                marca: marcaDevuelta,
-                quantity: refundItem.quantity,
-                motivo: 'Pedido pagado en un mes anterior con reemplazo de la misma marca: el reemplazo no se liquida, la nota tampoco',
-              });
-              return;
-            }
-
-            const returnEnCurso = ['RETURN_REQUESTED', 'IN_PROGRESS', 'RETURN_FAILED'].includes(order.returnStatus);
-            if (returnEnCurso) {
-              devolucionesEnCurso.push({
-                orderName: order.name,
-                sku: item.sku || 'SIN_SKU',
-                title: item.title,
-                variantTitle: item.variantTitle || '',
-                quantity: refundItem.quantity,
-                motivo: `Devolución en curso (${order.returnStatus})`,
-              });
-              return;
-            }
-
-            if (refundItem.restockType === 'NO_RESTOCK') {
-              devolucionesSinReposicion.push({
-                orderName: order.name,
-                sku: item.sku || 'SIN_SKU',
-                title: item.title,
-                variantTitle: item.variantTitle || '',
-                quantity: refundItem.quantity,
-                nota: 'Se descuenta igual: hubo reembolso, pero Shopify no repuso el articulo al stock',
-              });
-            }
 
             // Omitir reembolsos de artículos unfulfilled (no preparados) y que fueron eliminados (currentQuantity = 0)
             const isFulfilledOrPOS = !!fulfilledItemMap[item.id] || !!orderLoc;
@@ -920,8 +657,30 @@ app.post('/api/fetch-settlements', async (req, res) => {
         }
       });
 
-      // NOTA: acá había un bloque que registraba cancelaciones. Era código muerto: los pedidos
-      // cancelados salen por el `return` del principio de este forEach y nunca llegaban hasta acá.
+      if (order.cancelledAt) {
+        const cancellationTime = new Date(order.cancelledAt).getTime();
+        if (cancellationTime >= startDateTime && cancellationTime <= endDateTime && !processedRefundsForOrder) {
+          const lineItems = order.lineItems?.edges || [];
+          lineItems.forEach((edge) => {
+            const item = edge.node;
+            const brand = normalizeBrand(item.vendor, item.title);
+            const quantity = -item.quantity;
+            const salePrice = parseFloat(item.originalUnitPriceSet?.shopMoney?.amount || 0);
+
+            let unitCost = 0;
+            let hasCostInShopify = false;
+            if (item.variant?.inventoryItem?.unitCost?.amount) {
+              unitCost = parseFloat(item.variant.inventoryItem.unitCost.amount);
+              hasCostInShopify = true;
+            }
+
+            // Ubicación de cancelación: usar mapa de despacho, sino POS, sino 'Sin Ubicación'
+            const cancelLoc = itemLocationMap[item.id] || orderLoc || 'Sin Ubicación';
+
+            registerItemRecord(brand, item, quantity, order.cancelledAt, `${order.name}`, 'Cancelación', hasCostInShopify, unitCost, salePrice, order.displayFinancialStatus, cancelLoc);
+          });
+        }
+      }
     });
 
     const summary = Object.values(vendorAggregates).map((v) => {
@@ -939,47 +698,12 @@ app.post('/api/fetch-settlements', async (req, res) => {
       };
     });
 
-    ultimoDiagnostico = {
-      generado: new Date().toISOString(),
-      periodo: `${startDate} a ${endDate}`,
-      criterio: 'FECHA DE PAGO',
-      avisoTransacciones,
-      pedidosTraidos: allOrders.length,
-      articulosSinDespachar,
-      pedidosCreadosAntesPeroPagadosEnElPeriodo,
-      notasDeCreditoOmitidas,
-      devolucionesSinReposicion,
-      pedidosVigilados,
-      devolucionesEnCurso,
-    };
-
-    if (avisoTransacciones) {
-      console.log('=== AVISO ===');
-      console.log(avisoTransacciones);
-    }
-    if (articulosSinDespachar.length) {
-      console.log('=== ARTICULOS LIQUIDADOS QUE TODAVIA NO SE DESPACHARON ===');
-      console.log(articulosSinDespachar.map((a) => `${a.orderName} ${a.sku} x${a.quantity} (${a.marca})`).join('\n'));
-    }
-    if (devolucionesEnCurso.length) {
-      console.log('=== DEVOLUCIONES EN CURSO (no se descontaron) ===');
-      console.log(devolucionesEnCurso.map((d) => `${d.orderName} ${d.sku} x${d.quantity} - ${d.motivo}`).join('\n'));
-    }
-
     res.json({
       success: true,
       ordersCount: allOrders.length,
       summary,
       details: vendorAggregates,
       missingCosts,
-      criterio: 'FECHA DE PAGO',
-      avisoTransacciones,
-      devolucionesEnCurso,
-      devolucionesSinReposicion,
-      notasDeCreditoOmitidas,
-      pedidosVigilados,
-      articulosSinDespachar,
-      pedidosCreadosAntesPeroPagadosEnElPeriodo,
     });
   } catch (error) {
     console.error('Error al procesar liquidaciones:', error.message);
@@ -1028,21 +752,14 @@ app.post('/api/export-excel', async (req, res) => {
     const summarySheet = workbook.addWorksheet('Resumen General');
     summarySheet.views = [{ showGridLines: true }];
 
-    // Regla del 3% por transferencia: la misma que se aplica en las hojas "Agr -".
-    // x Brand & Co no lo lleva (arreglo con Wanda: no durante sus primeros meses).
-    const llevaDescuentoTransferencia = (nombreMarca) => {
-      const m = (nombreMarca || '').toUpperCase();
-      return !(m.includes('BRAND & CO') || m.includes('BRAND&CO'));
-    };
-
-    summarySheet.mergeCells('A1:I1');
+    summarySheet.mergeCells('A1:E1');
     const titleCell = summarySheet.getCell('A1');
     titleCell.value = 'RESUMEN GENERAL DE LIQUIDACIONES';
     titleCell.font = { name: 'Segoe UI', size: 16, bold: true, color: { argb: 'FF0F172A' } };
     titleCell.alignment = { vertical: 'middle', horizontal: 'left' };
     summarySheet.getRow(1).height = 40;
 
-    summarySheet.mergeCells('A2:I2');
+    summarySheet.mergeCells('A2:E2');
     const periodCell = summarySheet.getCell('A2');
     periodCell.value = `Periodo consultado: ${period || 'N/A'}`;
     periodCell.font = { name: 'Segoe UI', size: 10, italic: true, color: { argb: 'FF475569' } };
@@ -1056,15 +773,11 @@ app.post('/api/export-excel', async (req, res) => {
       'Ventas netas',
       'Costo de los bienes vendidos (Original)',
       'Costo de los bienes vendidos (Neto)',
-      'IVA 21%',
-      'TOTAL',
-      'DTO. 3% PAGO POR TRANSF.',
-      'TOTAL A TRANSFERIR',
     ];
     summarySheet.getRow(4).values = summaryHeaders;
     summarySheet.getRow(4).height = 28;
-
-    for (let col = 1; col <= 9; col++) {
+    
+    for (let col = 1; col <= 5; col++) {
       const cell = summarySheet.getCell(4, col);
       cell.fill = headerFill;
       cell.font = headerFont;
@@ -1072,57 +785,24 @@ app.post('/api/export-excel', async (req, res) => {
       cell.border = borderStyle;
     }
 
-    // El resumen ahora cierra la cuenta de cada marca igual que su hoja "Agr -":
-    // costo neto -> IVA -> TOTAL -> descuento por transferencia -> TOTAL A TRANSFERIR.
-    // Los importes se escriben como NUMEROS, no como formulas: Excel no calcula formulas
-    // mientras el archivo esta en "Vista protegida" y la fila de totales aparecia vacia.
-    const FILL_TRANSFERIR = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFDE047' } };
-    const FILL_DESCUENTO = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF5EEAD4' } };
-
     let startRow = 5;
-    const acumulado = { cantidad: 0, ventas: 0, original: 0, neto: 0, iva: 0, total: 0, descuento: 0, aTransferir: 0 };
-
     summary.forEach((row, index) => {
       const currentRowNum = startRow + index;
-
-      const neto = row.totalCost || 0;
-      const iva = neto * 0.21;
-      const total = neto + iva;
-      const descuento = llevaDescuentoTransferencia(row.brandName) ? total * -0.03 : 0;
-      const aTransferir = total + descuento;
-
-      acumulado.cantidad += row.totalQuantity || 0;
-      acumulado.ventas += row.totalSales || 0;
-      acumulado.original += row.totalCostOriginal || 0;
-      acumulado.neto += neto;
-      acumulado.iva += iva;
-      acumulado.total += total;
-      acumulado.descuento += descuento;
-      acumulado.aTransferir += aTransferir;
-
       summarySheet.getRow(currentRowNum).values = [
         row.brandName,
         row.totalQuantity,
         row.totalSales,
         row.totalCostOriginal,
-        neto,
-        iva,
-        total,
-        descuento,
-        aTransferir,
+        row.totalCost,
       ];
       summarySheet.getRow(currentRowNum).height = 22;
 
-      for (let col = 1; col <= 9; col++) {
+      for (let col = 1; col <= 5; col++) {
         const cell = summarySheet.getCell(currentRowNum, col);
-        cell.font = { name: 'Segoe UI', size: 10, bold: col === 9 };
+        cell.font = { name: 'Segoe UI', size: 10 };
         cell.border = borderStyle;
-
-        if (col === 9) {
-          cell.fill = FILL_TRANSFERIR;
-        } else if (col === 8) {
-          cell.fill = FILL_DESCUENTO;
-        } else if (currentRowNum % 2 === 0) {
+        
+        if (currentRowNum % 2 === 0) {
           cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } };
         }
 
@@ -1142,21 +822,17 @@ app.post('/api/export-excel', async (req, res) => {
     summarySheet.getRow(totalRowNum).height = 25;
     summarySheet.getRow(totalRowNum).values = [
       'TOTAL GENERAL',
-      acumulado.cantidad,
-      acumulado.ventas,
-      acumulado.original,
-      acumulado.neto,
-      acumulado.iva,
-      acumulado.total,
-      acumulado.descuento,
-      acumulado.aTransferir,
+      { formula: `SUM(B${startRow}:B${totalRowNum-1})` },
+      { formula: `SUM(C${startRow}:C${totalRowNum-1})` },
+      { formula: `SUM(D${startRow}:D${totalRowNum-1})` },
+      { formula: `SUM(E${startRow}:E${totalRowNum-1})` },
     ];
 
-    for (let col = 1; col <= 9; col++) {
+    for (let col = 1; col <= 5; col++) {
       const cell = summarySheet.getCell(totalRowNum, col);
       cell.font = { name: 'Segoe UI', size: 11, bold: true, color: { argb: 'FF0F172A' } };
       cell.border = doubleBottomBorder;
-      cell.fill = col === 9 ? FILL_TRANSFERIR : { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF1F5F9' } };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF1F5F9' } };
 
       if (col === 1) {
         cell.alignment = { vertical: 'middle', horizontal: 'left' };
@@ -1169,32 +845,13 @@ app.post('/api/export-excel', async (req, res) => {
       }
     }
 
-    // Linea final, bien visible: la plata que hay que pagar en total este periodo.
-    const filaPagar = totalRowNum + 2;
-    summarySheet.getRow(filaPagar).height = 32;
-    summarySheet.mergeCells(`A${filaPagar}:H${filaPagar}`);
-    const celdaEtiqueta = summarySheet.getCell(`A${filaPagar}`);
-    celdaEtiqueta.value = 'TOTAL A PAGAR (todas las marcas)';
-    celdaEtiqueta.font = { name: 'Segoe UI', size: 12, bold: true, color: { argb: 'FF0F172A' } };
-    celdaEtiqueta.alignment = { vertical: 'middle', horizontal: 'right' };
-    celdaEtiqueta.fill = FILL_TRANSFERIR;
-    const celdaPagar = summarySheet.getCell(`I${filaPagar}`);
-    celdaPagar.value = acumulado.aTransferir;
-    celdaPagar.font = { name: 'Segoe UI', size: 12, bold: true, color: { argb: 'FF0F172A' } };
-    celdaPagar.alignment = { vertical: 'middle', horizontal: 'right' };
-    celdaPagar.numFormat = '$#,##0.00';
-    celdaPagar.fill = FILL_TRANSFERIR;
-    celdaPagar.border = doubleBottomBorder;
-
     summarySheet.getColumn(1).width = 30;
     summarySheet.getColumn(2).width = 18;
     summarySheet.getColumn(3).width = 22;
     summarySheet.getColumn(4).width = 32;
     summarySheet.getColumn(5).width = 32;
-    summarySheet.getColumn(6).width = 18;
-    summarySheet.getColumn(7).width = 20;
-    summarySheet.getColumn(8).width = 24;
-    summarySheet.getColumn(9).width = 24;
+    summarySheet.getColumn(6).width = 22;
+    summarySheet.getColumn(7).width = 15;
 
     // HOJAS POR MARCA
     // Excel no permite dos hojas con el mismo nombre (y NO distingue mayus/minus).
@@ -1266,11 +923,9 @@ app.post('/api/export-excel', async (req, res) => {
         const currentRowNum = detailStartRow + index;
         
         const dateObj = new Date(item.date);
-        // Se muestra la fecha en hora de Argentina (-3), no en UTC: un despacho del 31/8 a las
-        // 22:52 es 01:52 UTC del 1/9, y mostrarlo como 01/09 en una liquidación de agosto confunde.
-        const formattedDate = isNaN(dateObj.getTime())
-          ? item.date
-          : new Date(dateObj.getTime() - 3 * 60 * 60 * 1000).toISOString().split('T')[0]; // YYYY-MM-DD
+        const formattedDate = isNaN(dateObj.getTime()) 
+          ? item.date 
+          : dateObj.toISOString().split('T')[0]; // Format as YYYY-MM-DD
 
         const refundVal = item.quantity < 0 ? item.totalSale : 0;
         const grossProfit = item.totalSale - item.totalCost;
